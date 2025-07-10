@@ -1,4 +1,9 @@
 #include "can.h"
+#include "motor.h"
+
+extern float received_angle;
+extern BLDCMotor M1;
+extern bool motor_enabled;
 
 enum canAction
 {
@@ -161,17 +166,33 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
   {
     switch (FDCAN_State)
     {
-    case WaitForCmd:
-      // Set some flag to indicate that sfoc has a new command.
-      if (RxHeader.Identifier = FDCAN_GlobalID)
-      {
+      case WaitForCmd:
+        if (RxHeader.Identifier == FDCAN_GlobalID) {
+          uint8_t cmd = RxData[0];
+          switch (cmd) {
+            case CMD_SET_ANGLE:
+              if (RxHeader.DataLength >= FDCAN_DLC_BYTES_5) {
+                float angle;
+                memcpy(&angle, &RxData[1], sizeof(float));
+                received_angle = angle;
+              }
+              break;
 
-      }
-      else
-      {
+            case CMD_ENABLE_MOTOR:
+              motor_enabled = true;
+              M1.enable();
+              break;
 
-      }
-      break;
+            case CMD_DISABLE_MOTOR:
+              motor_enabled = false;
+              M1.disable();
+              break;
+
+            default:
+              break;
+          }
+        }
+        break;
 
     case SearchForID:
       foundExtDevice = 1;

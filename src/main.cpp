@@ -10,7 +10,7 @@
 #include "stm32g4xx_hal_conf.h"
 #include "stm32g4xx_hal_fdcan.h"
 
-//#include "can.h"
+#include "can.h"
 #include "dfu.h"
 #include "utils.h"
 #include "InlineCurrentSenseSync.h"
@@ -32,6 +32,9 @@
 #define ISENSE_U    PB13    // VOPAMP3_P
 #define ISENSE_W    PB0 //NC
 
+#define CAN_TX      PB9
+#define CAN_RX      PB8
+
 #define POLEPAIRS 7
 #define RPHASE 0.6
 #define MOTORKV 360
@@ -39,6 +42,7 @@
 #define d_phase_inductance 0.0015 // H
 // Define the button pin
 #define BUTTON_PIN PC15
+#define LED_FAULT   PB11
 
 bool motor_enabled = true;
 bool last_button_state;
@@ -61,7 +65,7 @@ int loopiter = 10;
 unsigned int timestamp = micros();
 
 //Current Tune
-float current_bandwidth = 200.0; // Hz
+float current_bandwidth = 100.0; // Hz
 float sample_frequency = (1000000/50); // 50us loop =  20kHz 
 float Tf_ratio = 5.0; // ratio of the low pass filter time constant to the current control bandwidth
 float vel_bandwidth_ratio = 0.1;
@@ -75,20 +79,65 @@ SPISettings myMT6835SPISettings(12000000, MT6835_BITORDER, SPI_MODE3);
 MagneticSensorMT6835 E1 = MagneticSensorMT6835(ENC_CS, myMT6835SPISettings);
 InlineCurrentSenseSync CS1  = InlineCurrentSenseSync(0.005, 50, ISENSE_V, ISENSE_U, ISENSE_W);
 
+// board specific data
+typedef struct
+{
+	uint16_t signature;
+	Direction electricalDir;
+	float electricalZero;
+	uint16_t abzResolution;
+	uint8_t encoderCalibrated;
+	uint8_t canID;
+} userData;
+
+userData boardData;
+uint8_t updateData = 0;
+
+const uint16_t magicWord = 0xAF0C;
+
+// canbus things
+extern volatile uint8_t TxData[8];
+extern volatile uint8_t RxData[8];
+
+uint8_t configureCAN(void);
+
 // Encoder E1 = Encoder(PB4, PB5, 8192*2);
 // // interrupt routine intialisation
 // void doA(){E1.handleA();}
 // void doB(){E1.handleB();}
 
 void setup() {
+  pinMode(LED_FAULT, OUTPUT);
+  Serial3.begin(115200);
+  SimpleFOCDebug::enable(&Serial3);
+
+	uint8_t ret;
+	ret = configureCAN();
+	if (!ret){
+		SIMPLEFOC_DEBUG("CAN init failed.");
+		digitalWrite(LED_FAULT, HIGH);
+	}
+
+  	if (boardData.canID == 0x000) // If the can ID is not set, then we'll look for a new, free ID.
+	{
+		uint8_t foundID = FDCAN_FindUniqueID();
+		if (foundID != 0)
+		{
+			boardData.canID = foundID;
+			updateData = 1;
+			SIMPLEFOC_DEBUG("Unique CAN ID found: %i", foundID);
+		} else {
+			digitalWrite(LED_FAULT, HIGH);
+			SIMPLEFOC_DEBUG("Failed to find a unique CAN ID!");
+		}
+	}
+
   //User button setup
   pinMode(BUTTON_PIN, INPUT);
   // Initialize button state to current reading
   last_button_state = digitalRead(BUTTON_PIN);
   button_was_pressed = last_button_state;
 
-  Serial3.begin(115200);
-  SimpleFOCDebug::enable(&Serial3);
   E1.init();
   // E1.enableInterrupts(doA, doB);
   Serial3.println("Encoder ready");
@@ -200,4 +249,10 @@ void loop() {
   // Serial3.print("\t");
   // Serial3.println(E1.getABZResolution());
   // delay(1000);
+}
+
+uint8_t configureCAN(void)
+{
+	FDCAN_Start(0x7CC);
+	return 1;
 }
