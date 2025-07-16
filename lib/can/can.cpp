@@ -33,14 +33,15 @@ void CAN_Init(uint8_t can_id) {
     hfdcan1.Init.TransmitPause = DISABLE;
     hfdcan1.Init.ProtocolException = DISABLE;
 
+    // FIX: Timing parameters updated for 12MHz Clock -> 500kbit/s Speed
     hfdcan1.Init.NominalPrescaler = 1;
-    hfdcan1.Init.NominalSyncJumpWidth = 3;
-    hfdcan1.Init.NominalTimeSeg1 = 8;
-    hfdcan1.Init.NominalTimeSeg2 = 3;
+    hfdcan1.Init.NominalSyncJumpWidth = 4;
+    hfdcan1.Init.NominalTimeSeg1 = 15;
+    hfdcan1.Init.NominalTimeSeg2 = 8;
     hfdcan1.Init.DataPrescaler = 1;
-    hfdcan1.Init.DataSyncJumpWidth = 3;
-    hfdcan1.Init.DataTimeSeg1 = 8;
-    hfdcan1.Init.DataTimeSeg2 = 3;
+    hfdcan1.Init.DataSyncJumpWidth = 4;
+    hfdcan1.Init.DataTimeSeg1 = 15;
+    hfdcan1.Init.DataTimeSeg2 = 8;
 
     hfdcan1.Init.StdFiltersNbr = 1;
     hfdcan1.Init.ExtFiltersNbr = 0;
@@ -61,14 +62,13 @@ void CAN_Init(uint8_t can_id) {
     if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) Error_Handler();
 }
 
-// FIX: Simplified function signature. It now fills the header and data buffer you pass to it.
 bool CAN_Poll(FDCAN_RxHeaderTypeDef* rxHeader, uint8_t* rxData) {
     if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0) {
         if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, rxHeader, rxData) == HAL_OK) {
-            return true; // A message was successfully received
+            return true;
         }
     }
-    return false; // No new message
+    return false;
 }
 
 void CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc) {

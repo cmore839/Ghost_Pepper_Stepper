@@ -5,14 +5,50 @@
 #include "stm32g4xx_hal.h"
 #include "stm32g4xx_hal_fdcan.h"
 
-// CAN command IDs
+// CAN command IDs based on SimpleFOCRegisters.h
 enum CanCommandType : uint8_t {
-    CMD_NOP                 = 0x00,
-    CMD_SET_ANGLE           = 0x01,
-    CMD_SET_ENABLED         = 0x02,
-    CMD_JUMP_TO_DFU         = 0x10,
-    CMD_RECALIBRATE         = 0x11,
-    CMD_TELEMETRY_CONTROL   = 0x12
+    // Motion Control
+    CMD_SET_TARGET              = 0x01, // float
+    CMD_SET_ENABLE              = 0x02, // uint8_t
+    CMD_SET_MOTION_CONTROL_TYPE = 0x03, // uint8_t
+    CMD_SET_TORQUE_TYPE         = 0x04, // uint8_t
+
+    // Velocity PID & LPF
+    CMD_SET_VEL_P               = 0x10, // float
+    CMD_SET_VEL_I               = 0x11, // float
+    CMD_SET_VEL_D               = 0x12, // float
+    CMD_SET_VEL_RAMP            = 0x13, // float
+    CMD_SET_VEL_LPF_TF          = 0x14, // float
+
+    // Angle Controller
+    CMD_SET_ANGLE_P             = 0x20, // float
+
+    // Current (q-axis) PID & LPF
+    CMD_SET_CURQ_P              = 0x30, // float
+    CMD_SET_CURQ_I              = 0x31, // float
+    CMD_SET_CURQ_D              = 0x32, // float
+    CMD_SET_CURQ_LPF_TF         = 0x33, // float
+
+    // Current (d-axis) PID & LPF
+    CMD_SET_CURD_P              = 0x40, // float
+    CMD_SET_CURD_I              = 0x41, // float
+    CMD_SET_CURD_D              = 0x42, // float
+    CMD_SET_CURD_LPF_TF         = 0x43, // float
+
+    // Limits
+    CMD_SET_VOLTAGE_LIMIT       = 0x50, // float
+    CMD_SET_CURRENT_LIMIT       = 0x51, // float
+    CMD_SET_VELOCITY_LIMIT      = 0x52, // float
+    
+    // Telemetry & System
+    CMD_TELEMETRY_CONTROL       = 0x80, // uint8_t
+    CMD_REQUEST_REGISTER        = 0x81, // uint8_t (payload is the register to read)
+    CMD_REGISTER_RESPONSE       = 0x82, // Response from motor with register data
+    CMD_ADV_TELEMETRY_CONTROL   = 0x83, // New command for advanced telemetry
+    CMD_SET_TELEMETRY_RATE      = 0x84, // New command to set telemetry period in ms
+
+    CMD_JUMP_TO_DFU             = 0xF0,
+    CMD_RECALIBRATE             = 0xF1
 };
 
 // Global CAN data buffer for transmitting
@@ -21,8 +57,6 @@ extern volatile uint8_t TxData[8];
 void CAN_Init(uint8_t can_id);
 void CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc);
 uint8_t CAN_FindUniqueID();
-
-// FIX: Simplified function signature
 bool CAN_Poll(FDCAN_RxHeaderTypeDef* rxHeader, uint8_t* rxData);
 
 #endif // AIOLI_CAN_H
