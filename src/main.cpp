@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <SPI.h>
+#include <math.h> // For pow() function in auto-tune
 
 #include <SimpleFOC.h>
 #include "SimpleFOCDrivers.h"
@@ -42,6 +43,7 @@
 bool motor_enabled = false;
 float target_value = 0;
 uint8_t telemetry_mode = 0;
+bool autotune_running = false;
 
 // Telemetry Timing
 unsigned long last_telemetry_time = 0;
@@ -71,9 +73,10 @@ void loadSettings();
 void saveSettings();
 void runCalibrationSequence();
 void processCANCommands();
-// FIX: Added the 'int' parameter to the function prototype to match the definition.
 void sendAdvancedCANTelemetry(int current_loop_time);
 void sendRegisterValue(uint8_t register_id, float value);
+void runAutoTuneSequence();
+float normalizeAngle(float angle);
 
 void setup() {
     pinMode(LED_FAULT, OUTPUT);
@@ -150,8 +153,27 @@ void setup() {
     digitalWrite(LED_FAULT, LOW);
 }
 
+float normalizeAngle(float angle){
+  float a = fmod(angle, _2PI);
+  return a >= 0 ? a : (a + _2PI);
+}
+
 void loop() {
     unsigned long loop_start_us = micros();
+
+    if (autotune_running) {
+        runAutoTuneSequence();
+        autotune_running = false; 
+        
+        // FIX: Flush any stale CAN commands that arrived during the blocking tune
+        SIMPLEFOC_DEBUG("Flushing CAN RX buffer...");
+        FDCAN_RxHeaderTypeDef dummyHeader;
+        uint8_t dummyData[8];
+        while(CAN_Poll(&dummyHeader, dummyData)) { } // Poll until buffer is empty
+        SIMPLEFOC_DEBUG("CAN RX buffer flushed.");
+        
+        return; // Skip the rest of this loop iteration
+    }
 
     processCANCommands(); 
 
@@ -160,12 +182,9 @@ void loop() {
         M1.move(target_value);
     }
     
-    // Non-blocking telemetry timer
     if (telemetry_mode > 0 && (millis() - last_telemetry_time > telemetry_period_ms)) {
         last_telemetry_time = millis();
-        // Calculate loop time just before sending telemetry
         int current_loop_time = micros() - loop_start_us;
-
         if (telemetry_mode == 2) {
             sendAdvancedCANTelemetry(current_loop_time);
         }
@@ -188,6 +207,7 @@ void processCANCommands() {
         }
 
         switch (cmd_type) {
+            case CMD_START_AUTOTUNE: autotune_running = true; break;
             case CMD_SET_TARGET: target_value = payload_float; break;
             case CMD_SET_ENABLE:
                 motor_enabled = (payload_uint8 == 1);
@@ -220,13 +240,74 @@ void processCANCommands() {
             case CMD_REQUEST_REGISTER:
                 {
                     uint8_t requested_reg = payload_uint8;
-                    // ... (register response logic remains the same) ...
+                    switch(requested_reg) {
+                        case CMD_SET_VEL_P: sendRegisterValue(requested_reg, M1.PID_velocity.P); break;
+                        case CMD_SET_VEL_I: sendRegisterValue(requested_reg, M1.PID_velocity.I); break;
+                        case CMD_SET_VEL_D: sendRegisterValue(requested_reg, M1.PID_velocity.D); break;
+                        case CMD_SET_VEL_RAMP: sendRegisterValue(requested_reg, M1.PID_velocity.output_ramp); break;
+                        case CMD_SET_VEL_LPF_TF: sendRegisterValue(requested_reg, M1.LPF_velocity.Tf); break;
+                        case CMD_SET_ANGLE_P: sendRegisterValue(requested_reg, M1.P_angle.P); break;
+                        case CMD_SET_VOLTAGE_LIMIT: sendRegisterValue(requested_reg, M1.voltage_limit); break;
+                        case CMD_SET_CURRENT_LIMIT: sendRegisterValue(requested_reg, M1.current_limit); break;
+                        case CMD_SET_VELOCITY_LIMIT: sendRegisterValue(requested_reg, M1.velocity_limit); break;
+                    }
                 }
                 break;
             case CMD_RECALIBRATE: runCalibrationSequence(); break;
             case CMD_JUMP_TO_DFU: jump_to_bootloader(); break;
         }
     }
+}
+
+void runAutoTuneSequence() {
+    SIMPLEFOC_DEBUG("Starting Auto-Tune Frequency Sweep...");
+    digitalWrite(LED_FAULT, HIGH);
+
+    MotionControlType original_controller = M1.controller;
+    TorqueControlType original_torque = M1.torque_controller;
+    float original_voltage_limit = M1.voltage_limit;
+
+    M1.controller = MotionControlType::torque;
+    M1.torque_controller = TorqueControlType::voltage;
+    M1.voltage_limit = 2.0;
+
+    float start_freq = 5.0;
+    float end_freq = 500.0;
+    int steps = 50;
+    float voltage_amplitude = 1.0;
+
+    for (int i = 0; i < steps; i++) {
+        float freq = start_freq * pow(end_freq / start_freq, (float)i / (steps - 1));
+        float omega = freq * _2PI;
+        
+        unsigned long t_start = micros();
+        float max_vel = 0;
+        unsigned long sweep_duration_ms = 200;
+        while(micros() - t_start < sweep_duration_ms * 1000) {
+            float angle = normalizeAngle( (float)(micros() - t_start) / 1000000.0f * omega);
+            M1.move(voltage_amplitude * cos(angle));
+            M1.loopFOC();
+            if (abs(M1.shaft_velocity) > max_vel) {
+                max_vel = abs(M1.shaft_velocity);
+            }
+        }
+        
+        uint8_t response_data[8];
+        float magnitude = max_vel / voltage_amplitude;
+        memcpy(&response_data[0], &freq, sizeof(float));
+        memcpy(&response_data[4], &magnitude, sizeof(float));
+        CAN_Send(board_data.can_id + 104, response_data, FDCAN_DLC_BYTES_8);
+        delay(20);
+    }
+
+    uint8_t done_data[1] = {0xFF};
+    CAN_Send(board_data.can_id + 104, done_data, FDCAN_DLC_BYTES_1);
+
+    M1.controller = original_controller;
+    M1.torque_controller = original_torque;
+    M1.voltage_limit = original_voltage_limit;
+    digitalWrite(LED_FAULT, LOW);
+    SIMPLEFOC_DEBUG("Auto-Tune complete.");
 }
 
 void sendRegisterValue(uint8_t register_id, float value) {
@@ -247,7 +328,6 @@ void sendAdvancedCANTelemetry(int current_loop_time) {
     memcpy(&frame2_data[4], &M1.current.d, sizeof(float));
     CAN_Send(board_data.can_id + 102, frame2_data, FDCAN_DLC_BYTES_8);
 
-    // New dedicated frame for loop time
     uint8_t frame3_data[2];
     uint16_t loop_us = (uint16_t)current_loop_time;
     memcpy(&frame3_data[0], &loop_us, sizeof(uint16_t));

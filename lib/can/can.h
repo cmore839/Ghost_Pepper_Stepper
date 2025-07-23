@@ -46,6 +46,8 @@ enum CanCommandType : uint8_t {
     CMD_REGISTER_RESPONSE       = 0x82, // Response from motor with register data
     CMD_ADV_TELEMETRY_CONTROL   = 0x83, // New command for advanced telemetry
     CMD_SET_TELEMETRY_RATE      = 0x84, // New command to set telemetry period in ms
+    CMD_START_AUTOTUNE          = 0x85, // New command to start the auto-tuning sequence
+    CMD_AUTOTUNE_RESPONSE       = 0x86, // Response with frequency sweep data
 
     CMD_JUMP_TO_DFU             = 0xF0,
     CMD_RECALIBRATE             = 0xF1
