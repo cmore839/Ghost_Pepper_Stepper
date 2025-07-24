@@ -53,9 +53,12 @@ const uint16_t EEPROM_MAGIC_WORD = 0xAF0C;
 
 // Application State
 bool motor_enabled = false;
-float target_angle = 0.0f;
+float target_value = 0.0f;
 unsigned long last_telemetry_time = 0;
 int telemetry_state = 0;
+unsigned long telemetry_period = 10;
+unsigned long loop_duration_us = 0;
+uint8_t telemetry_mask = TELEM_ENABLE_ANGLE | TELEM_ENABLE_VELOCITY | TELEM_ENABLE_CURRENT_Q | TELEM_ENABLE_LOOP_TIME;
 
 // Function Prototypes
 void loadSettings();
@@ -66,67 +69,35 @@ void send_param_response(uint8_t param_id, float value);
 void setup() {
     pinMode(LED_FAULT, OUTPUT);
     digitalWrite(LED_FAULT, HIGH);
+    
     Serial3.begin(115200);
     SimpleFOCDebug::enable(&Serial3);
-    SIMPLEFOC_DEBUG("--- Core Firmware with Minimal PID CAN ---");
+    SIMPLEFOC_DEBUG("--- Core Firmware: High-Frequency CAN (Optimized) ---");
 
     loadSettings();
-    
     CAN_Init(board_data.can_id);
-    SIMPLEFOC_DEBUG("Motor CAN ID set to:", board_data.can_id);
     
-    // Original Tuning Parameters
-    float current_bandwidth = 100.0; 
-    float sample_frequency = (1000000 / 50);
-    float Tf_ratio = 5.0; 
-    float vel_bandwidth_ratio = 0.1;
-    float vel_PI_ratio = 10.0; 
-    float pos_bandwidth_ratio = 0.1;
-    float pos_PI_ratio = 10.0;
+    float current_bandwidth = 100.0; float sample_frequency = (1000000 / 50); float Tf_ratio = 5.0; 
+    float vel_bandwidth_ratio = 0.1; float vel_PI_ratio = 10.0; float pos_bandwidth_ratio = 0.1; float pos_PI_ratio = 10.0;
 
-    M1.velocity_limit = 99999;
-    M1.voltage_limit = 1.0;
-    M1.current_limit = 2.0;
-    DR1.pwm_frequency = 20000;
-    DR1.voltage_power_supply = 8.0;
-    M1.voltage_sensor_align = 1.0;
+    M1.velocity_limit = 99999; M1.voltage_limit = 1.0; M1.current_limit = 2.0;
+    DR1.pwm_frequency = 20000; DR1.voltage_power_supply = 8.0; M1.voltage_sensor_align = 1.0;
 
-    M1.PID_current_q.P = q_phase_inductance*current_bandwidth*_2PI;
-    M1.PID_current_q.I= M1.PID_current_q.P*RPHASE/q_phase_inductance;
-    M1.PID_current_d.P= d_phase_inductance*current_bandwidth*_2PI;
-    M1.PID_current_d.I = M1.PID_current_d.P*RPHASE/d_phase_inductance;
-    M1.LPF_current_q.Tf = 1/(Tf_ratio*current_bandwidth); 
-    M1.LPF_current_d.Tf = 1/(Tf_ratio*current_bandwidth);
-    M1.motion_downsample = 0;
+    M1.motion_downsample = 9;
 
-    M1.PID_velocity.P = M1.PID_current_q.P * vel_bandwidth_ratio;
-    M1.PID_velocity.I = M1.PID_velocity.P*vel_PI_ratio;
+    M1.PID_current_q.P = q_phase_inductance*current_bandwidth*_2PI; M1.PID_current_q.I= M1.PID_current_q.P*RPHASE/q_phase_inductance;
+    M1.PID_current_d.P= d_phase_inductance*current_bandwidth*_2PI; M1.PID_current_d.I = M1.PID_current_d.P*RPHASE/d_phase_inductance;
+    M1.LPF_current_q.Tf = 1/(Tf_ratio*current_bandwidth); M1.LPF_current_d.Tf = 1/(Tf_ratio*current_bandwidth);
+    M1.PID_velocity.P = M1.PID_current_q.P * vel_bandwidth_ratio; M1.PID_velocity.I = M1.PID_velocity.P*vel_PI_ratio;
     M1.LPF_velocity.Tf = (1/(Tf_ratio*M1.PID_velocity.P*sample_frequency)); 
-   
-    M1.P_angle.P = M1.PID_velocity.P*pos_bandwidth_ratio*sample_frequency;
-    M1.P_angle.I = (M1.P_angle.P*pos_PI_ratio)/sample_frequency;
+    M1.P_angle.P = M1.PID_velocity.P*pos_bandwidth_ratio*sample_frequency; M1.P_angle.I = (M1.P_angle.P*pos_PI_ratio)/sample_frequency;
     
-    E1.init();
-    M1.linkSensor(&E1);
-    DR1.init();
-    M1.linkDriver(&DR1);
-    CS1.linkDriver(&DR1);
-    CS1.init();
-    M1.linkCurrentSense(&CS1);
-    
-    M1.foc_modulation = FOCModulationType::SpaceVectorPWM;
-    M1.controller = MotionControlType::angle;
-    M1.torque_controller = TorqueControlType::foc_current;
+    E1.init(); M1.linkSensor(&E1); DR1.init(); M1.linkDriver(&DR1); CS1.linkDriver(&DR1); CS1.init(); M1.linkCurrentSense(&CS1);
+    M1.foc_modulation = FOCModulationType::SpaceVectorPWM; M1.controller = MotionControlType::angle; M1.torque_controller = TorqueControlType::foc_current;
     
     M1.init();
-    
-    if (!board_data.encoder_calibrated) {
-        runCalibrationSequence();
-    } else {
-        M1.sensor_direction = board_data.sensor_direction;
-        M1.zero_electric_angle = board_data.zero_electric_angle;
-    }
-
+    if (!board_data.encoder_calibrated) { runCalibrationSequence(); } 
+    else { M1.sensor_direction = board_data.sensor_direction; M1.zero_electric_angle = board_data.zero_electric_angle; }
     M1.initFOC();
     M1.disable(); 
     SIMPLEFOC_DEBUG("Setup complete. Motor ready.");
@@ -134,86 +105,108 @@ void setup() {
 }
 
 void loop() {
+    unsigned long start_time_us = micros();
+
     M1.loopFOC();
+    if (motor_enabled) { M1.move(target_value); }
 
-    if (motor_enabled) {
-        M1.move(target_angle);
-    }
-
-    // --- CAN Command Polling ---
     FDCAN_RxHeaderTypeDef rxHeader;
     uint8_t rxData[8];
     if (CAN_Poll(&rxHeader, rxData)) {
         if (rxHeader.Identifier == board_data.can_id) {
-            // ... (Your command handling logic remains the same) ...
-            CommandType cmd = (CommandType)rxData[0];
-            float payload_float;
+            SimpleFOCRegister reg = (SimpleFOCRegister)rxData[0];
             
-            if (rxHeader.DataLength >= 5) { // Commands with a float payload
-                memcpy(&payload_float, &rxData[1], sizeof(float));
+            if (reg == CAN_ID_REQUEST_PARAM) {
+                uint8_t param_to_send = rxData[1];
+                if (param_to_send == REG_VEL_PID_P) send_param_response(param_to_send, M1.PID_velocity.P);
+                if (param_to_send == REG_VEL_PID_I) send_param_response(param_to_send, M1.PID_velocity.I);
+                if (param_to_send == REG_ANG_PID_P) send_param_response(param_to_send, M1.P_angle.P);
+                if (param_to_send == REG_ANG_PID_I) send_param_response(param_to_send, M1.P_angle.I);
+                if (param_to_send == REG_CURQ_PID_P) send_param_response(param_to_send, M1.PID_current_q.P);
+                if (param_to_send == REG_CURQ_PID_I) send_param_response(param_to_send, M1.PID_current_q.I);
+                if (param_to_send == REG_CURD_PID_P) send_param_response(param_to_send, M1.PID_current_d.P);
+                if (param_to_send == REG_CURD_PID_I) send_param_response(param_to_send, M1.PID_current_d.I);
+                return;
             }
-            
-            switch(cmd) {
-                case CMD_SET_ENABLE:
+
+            switch(reg) {
+                case REG_ENABLE:
                     motor_enabled = (rxData[1] == 1);
-                    if (motor_enabled) { M1.enable(); SIMPLEFOC_DEBUG("Motor ENABLED"); }
-                    else { M1.disable(); SIMPLEFOC_DEBUG("Motor DISABLED"); }
+                    if (motor_enabled) M1.enable(); else M1.disable();
                     break;
-                case CMD_SET_TARGET:
-                    target_angle = payload_float;
-                    SIMPLEFOC_DEBUG("New Target:", target_angle);
+                case REG_CONTROL_MODE:
+                    M1.controller = (MotionControlType)rxData[1];
+                    target_value = 0;
                     break;
-                case CMD_SET_VEL_P:
-                    M1.PID_velocity.P = payload_float;
-                    SIMPLEFOC_DEBUG("Set Vel P:", payload_float);
+                case REG_TELEMETRY_CONFIG:
+                    if(rxHeader.DataLength >= 2) {
+                        telemetry_mask = rxData[1];
+                    }
                     break;
-                case CMD_SET_VEL_I:
-                    M1.PID_velocity.I = payload_float;
-                    SIMPLEFOC_DEBUG("Set Vel I:", payload_float);
+                case REG_TARGET:
+                case REG_VEL_PID_P: case REG_VEL_PID_I:
+                case REG_ANG_PID_P: case REG_ANG_PID_I:
+                case REG_CURQ_PID_P: case REG_CURQ_PID_I:
+                case REG_CURD_PID_P: case REG_CURD_PID_I: {
+                    float payload_float;
+                    if (rxHeader.DataLength >= 5) {
+                        memcpy(&payload_float, &rxData[1], sizeof(float));
+                        if(reg == REG_TARGET) target_value = payload_float;
+                        if(reg == REG_VEL_PID_P) M1.PID_velocity.P = payload_float;
+                        if(reg == REG_VEL_PID_I) M1.PID_velocity.I = payload_float;
+                        if(reg == REG_ANG_PID_P) M1.P_angle.P = payload_float;
+                        if(reg == REG_ANG_PID_I) M1.P_angle.I = payload_float;
+                        if(reg == REG_CURQ_PID_P) M1.PID_current_q.P = payload_float;
+                        if(reg == REG_CURQ_PID_I) M1.PID_current_q.I = payload_float;
+                        if(reg == REG_CURD_PID_P) M1.PID_current_d.P = payload_float;
+                        if(reg == REG_CURD_PID_I) M1.PID_current_d.I = payload_float;
+                    }
                     break;
-                case CMD_SET_ANGLE_P:
-                    M1.P_angle.P = payload_float;
-                    SIMPLEFOC_DEBUG("Set Angle P:", payload_float);
+                }
+                case REG_TELEMETRY_PERIOD: {
+                    if (rxHeader.DataLength >= 3) {
+                        uint16_t new_period;
+                        memcpy(&new_period, &rxData[1], sizeof(uint16_t));
+                        if (new_period > 0) telemetry_period = new_period;
+                    }
                     break;
-                case CMD_REQUEST_PARAM:
-                    uint8_t param_to_send = rxData[1];
-                    if (param_to_send == CMD_SET_VEL_P) send_param_response(param_to_send, M1.PID_velocity.P);
-                    if (param_to_send == CMD_SET_VEL_I) send_param_response(param_to_send, M1.PID_velocity.I);
-                    if (param_to_send == CMD_SET_ANGLE_P) send_param_response(param_to_send, M1.P_angle.P);
-                    break;
+                }
             }
         }
     }
 
-    // --- **MODIFIED**: CAN Telemetry Sending with Multiplexing ---
-    if (millis() - last_telemetry_time > 10) { // Keep the ~100Hz total update rate
+    if (millis() - last_telemetry_time > telemetry_period) {
         last_telemetry_time = millis();
         
-        uint8_t telemetry_data[5]; // 1 byte for ID + 4 bytes for float
-        float value_to_send;
+        int states_checked = 0;
+        while(states_checked < 4) {
+            bool should_send = false;
+            switch(telemetry_state) {
+                case 0: if (telemetry_mask & TELEM_ENABLE_ANGLE) should_send = true; break;
+                case 1: if (telemetry_mask & TELEM_ENABLE_VELOCITY) should_send = true; break;
+                case 2: if (telemetry_mask & TELEM_ENABLE_CURRENT_Q) should_send = true; break;
+                case 3: if (telemetry_mask & TELEM_ENABLE_LOOP_TIME) should_send = true; break;
+            }
 
-        // Cycle through the telemetry states
-        switch(telemetry_state) {
-            case 0:
-                telemetry_data[0] = TELEM_ANGLE;
-                value_to_send = M1.shaft_angle;
+            if (should_send) {
+                uint8_t telemetry_data[5];
+                switch(telemetry_state) {
+                    case 0: { telemetry_data[0] = TELEM_ANGLE; float v = M1.shaft_angle; memcpy(&telemetry_data[1], &v, 4); break; }
+                    case 1: { telemetry_data[0] = TELEM_VELOCITY; float v = M1.shaft_velocity; memcpy(&telemetry_data[1], &v, 4); break; }
+                    case 2: { telemetry_data[0] = TELEM_CURRENT_Q; float v = M1.current.q; memcpy(&telemetry_data[1], &v, 4); break; }
+                    case 3: { telemetry_data[0] = TELEM_LOOP_TIME; memcpy(&telemetry_data[1], &loop_duration_us, 4); break; }
+                }
+                CAN_Send(CAN_ID_MOTOR_1_TELEMETRY, telemetry_data, FDCAN_DLC_BYTES_5);
                 break;
-            case 1:
-                telemetry_data[0] = TELEM_VELOCITY;
-                value_to_send = M1.shaft_velocity;
-                break;
-            case 2:
-                telemetry_data[0] = TELEM_CURRENT_Q;
-                value_to_send = M1.current.q;
-                break;
+            }
+
+            telemetry_state = (telemetry_state + 1) % 4;
+            states_checked++;
         }
-
-        memcpy(&telemetry_data[1], &value_to_send, sizeof(float));
-        CAN_Send(CAN_ID_MOTOR_1_TELEMETRY, telemetry_data, FDCAN_DLC_BYTES_5);
-
-        // Increment state for next loop iteration
-        telemetry_state = (telemetry_state + 1) % 3;
+        telemetry_state = (telemetry_state + 1) % 4;
     }
+
+    loop_duration_us = micros() - start_time_us;
 }
 
 void send_param_response(uint8_t param_id, float value) {
