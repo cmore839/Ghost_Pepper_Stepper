@@ -54,11 +54,11 @@ const uint16_t EEPROM_MAGIC_WORD = 0xAF0C;
 // Application State
 bool motor_enabled = false;
 float target_value = 0.0f;
-unsigned long last_telemetry_time = 0;
 int telemetry_state = 0;
-unsigned long telemetry_period = 10;
 unsigned long loop_duration_us = 0;
 uint8_t telemetry_mask = TELEM_ENABLE_ANGLE | TELEM_ENABLE_VELOCITY | TELEM_ENABLE_CURRENT_Q | TELEM_ENABLE_LOOP_TIME;
+uint32_t last_telemetry_time_us = 0;
+uint32_t telemetry_period_us = 10000; // Default to 100Hz (10000 µs)
 
 // Function Prototypes
 void loadSettings();
@@ -72,7 +72,7 @@ void setup() {
     
     Serial3.begin(115200);
     SimpleFOCDebug::enable(&Serial3);
-    SIMPLEFOC_DEBUG("--- Core Firmware: High-Frequency CAN (Optimized) ---");
+    SIMPLEFOC_DEBUG("--- Core Firmware: High-Resolution CAN ---");
 
     loadSettings();
     CAN_Init(board_data.can_id);
@@ -164,10 +164,12 @@ void loop() {
                     break;
                 }
                 case REG_TELEMETRY_PERIOD: {
-                    if (rxHeader.DataLength >= 3) {
-                        uint16_t new_period;
-                        memcpy(&new_period, &rxData[1], sizeof(uint16_t));
-                        if (new_period > 0) telemetry_period = new_period;
+                    if (rxHeader.DataLength >= 5) {
+                        uint32_t new_period_us;
+                        memcpy(&new_period_us, &rxData[1], sizeof(uint32_t));
+                        if (new_period_us > 0) {
+                            telemetry_period_us = new_period_us;
+                        }
                     }
                     break;
                 }
@@ -175,8 +177,8 @@ void loop() {
         }
     }
 
-    if (millis() - last_telemetry_time > telemetry_period) {
-        last_telemetry_time = millis();
+    if (micros() - last_telemetry_time_us > telemetry_period_us) {
+        last_telemetry_time_us = micros();
         
         int states_checked = 0;
         while(states_checked < 4) {
