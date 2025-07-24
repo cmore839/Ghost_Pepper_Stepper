@@ -55,6 +55,7 @@ const uint16_t EEPROM_MAGIC_WORD = 0xAF0C;
 bool motor_enabled = false;
 float target_angle = 0.0f;
 unsigned long last_telemetry_time = 0;
+int telemetry_state = 0;
 
 // Function Prototypes
 void loadSettings();
@@ -144,7 +145,7 @@ void loop() {
     uint8_t rxData[8];
     if (CAN_Poll(&rxHeader, rxData)) {
         if (rxHeader.Identifier == board_data.can_id) {
-            SIMPLEFOC_DEBUG("CAN Command Received!");
+            // ... (Your command handling logic remains the same) ...
             CommandType cmd = (CommandType)rxData[0];
             float payload_float;
             
@@ -184,15 +185,34 @@ void loop() {
         }
     }
 
-    // --- CAN Telemetry Sending ---
-    if (millis() - last_telemetry_time > 10) { // Send at ~100Hz
+    // --- **MODIFIED**: CAN Telemetry Sending with Multiplexing ---
+    if (millis() - last_telemetry_time > 10) { // Keep the ~100Hz total update rate
         last_telemetry_time = millis();
         
-        float current_angle = M1.shaft_angle;
-        uint8_t telemetry_data[4];
-        memcpy(telemetry_data, &current_angle, sizeof(float));
-        
-        CAN_Send(CAN_ID_MOTOR_1_TELEMETRY, telemetry_data, FDCAN_DLC_BYTES_4);
+        uint8_t telemetry_data[5]; // 1 byte for ID + 4 bytes for float
+        float value_to_send;
+
+        // Cycle through the telemetry states
+        switch(telemetry_state) {
+            case 0:
+                telemetry_data[0] = TELEM_ANGLE;
+                value_to_send = M1.shaft_angle;
+                break;
+            case 1:
+                telemetry_data[0] = TELEM_VELOCITY;
+                value_to_send = M1.shaft_velocity;
+                break;
+            case 2:
+                telemetry_data[0] = TELEM_CURRENT_Q;
+                value_to_send = M1.current.q;
+                break;
+        }
+
+        memcpy(&telemetry_data[1], &value_to_send, sizeof(float));
+        CAN_Send(CAN_ID_MOTOR_1_TELEMETRY, telemetry_data, FDCAN_DLC_BYTES_5);
+
+        // Increment state for next loop iteration
+        telemetry_state = (telemetry_state + 1) % 3;
     }
 }
 

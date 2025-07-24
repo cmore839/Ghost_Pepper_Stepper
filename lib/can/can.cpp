@@ -4,6 +4,8 @@
 static FDCAN_HandleTypeDef hfdcan1;
 static FDCAN_TxHeaderTypeDef TxHeader;
 
+// ... (CAN_Init and other functions remain the same) ...
+
 void CAN_Init(uint8_t can_id) {
     hfdcan1.Instance = FDCAN1;
     hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
@@ -34,7 +36,7 @@ void CAN_Init(uint8_t can_id) {
     sFilterConfig.FilterType = FDCAN_FILTER_MASK;
     sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
     sFilterConfig.FilterID1 = can_id;
-    sFilterConfig.FilterID2 = 0x7FF;
+    sFilterConfig.FilterID2 = 0x7FF; // Ignores the filter
     if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) Error_Handler();
     if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK) Error_Handler();
     if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) Error_Handler();
@@ -49,7 +51,14 @@ bool CAN_Poll(FDCAN_RxHeaderTypeDef* rxHeader, uint8_t* rxData) {
     return false;
 }
 
-void CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc) {
+
+// **MODIFIED**: This function now returns 'bool' and checks for a free mailbox.
+bool CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc) {
+    // **CRITICAL CHANGE**: Check if there's space in the Tx FIFO queue.
+    if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) {
+        return false; // Mailbox is full, do not send.
+    }
+
     TxHeader.Identifier = id;
     TxHeader.IdType = FDCAN_STANDARD_ID;
     TxHeader.TxFrameType = FDCAN_DATA_FRAME;
@@ -61,9 +70,12 @@ void CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc) {
     TxHeader.MessageMarker = 0;
     
     if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader, data) != HAL_OK) {
-        // In this minimal version, we don't freeze on a send error.
+        return false; // Send command failed.
     }
+
+    return true; // Message sent successfully.
 }
+
 
 void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef *hfdcan) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
