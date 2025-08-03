@@ -1,12 +1,12 @@
 #include "can.h"
 #include <string.h>
+#include <SimpleFOC.h>
 
 static FDCAN_HandleTypeDef hfdcan1;
 static FDCAN_TxHeaderTypeDef TxHeader;
 
-// ... (CAN_Init and other functions remain the same) ...
-
 void CAN_Init(uint8_t can_id) {
+    SIMPLEFOC_DEBUG("CAN: Initializing FDCAN peripheral...");
     hfdcan1.Instance = FDCAN1;
     hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
     hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
@@ -29,17 +29,22 @@ void CAN_Init(uint8_t can_id) {
     hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
 
     if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) Error_Handler();
+    SIMPLEFOC_DEBUG("CAN: FDCAN peripheral initialized.");
 
     FDCAN_FilterTypeDef sFilterConfig;
     sFilterConfig.IdType = FDCAN_STANDARD_ID;
     sFilterConfig.FilterIndex = 0;
-    sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+    sFilterConfig.FilterType = FDCAN_FILTER_DUAL;
     sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-    sFilterConfig.FilterID1 = can_id;
-    sFilterConfig.FilterID2 = 0x7FF; // Ignores the filter
+    sFilterConfig.FilterID1 = CAN_ID_COMMAND_BASE + can_id;
+    sFilterConfig.FilterID2 = CAN_ID_SCAN_BROADCAST;
     if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) Error_Handler();
+
     if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK) Error_Handler();
+    
+    SIMPLEFOC_DEBUG("CAN: Starting FDCAN...");
     if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) Error_Handler();
+    SIMPLEFOC_DEBUG("CAN: FDCAN Started.");
 }
 
 bool CAN_Poll(FDCAN_RxHeaderTypeDef* rxHeader, uint8_t* rxData) {
@@ -51,18 +56,15 @@ bool CAN_Poll(FDCAN_RxHeaderTypeDef* rxHeader, uint8_t* rxData) {
     return false;
 }
 
-
-// **MODIFIED**: This function now returns 'bool' and checks for a free mailbox.
 bool CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc) {
-    // **CRITICAL CHANGE**: Check if there's space in the Tx FIFO queue.
     if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) {
-        return false; // Mailbox is full, do not send.
+        return false;
     }
 
     TxHeader.Identifier = id;
     TxHeader.IdType = FDCAN_STANDARD_ID;
     TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    TxHeader.DataLength = dlc;
+    TxHeader.DataLength = dlc; // This now works because main.cpp will pass the correct HAL enum
     TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
     TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
     TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
@@ -70,12 +72,11 @@ bool CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc) {
     TxHeader.MessageMarker = 0;
     
     if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader, data) != HAL_OK) {
-        return false; // Send command failed.
+        return false;
     }
 
-    return true; // Message sent successfully.
+    return true;
 }
-
 
 void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef *hfdcan) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
