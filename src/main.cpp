@@ -6,6 +6,7 @@
 #include "encoders/mt6835/MagneticSensorMT6835.h"
 #include "InlineCurrentSenseSync.h"
 #include "can.h"
+#include "motor_characterization.h" // Include the new standalone characterization file
 
 // --- Hardware Definitions ---
 // Pin Definitions
@@ -28,7 +29,8 @@ BLDCDriver3PWM DR1 = BLDCDriver3PWM(MOT_A1, MOT_A2, MOT_B1, MOT_EN);
 BLDCMotor M1 = BLDCMotor(7);
 SPISettings myMT6835SPISettings(12000000, MT6835_BITORDER, SPI_MODE3);
 MagneticSensorMT6835 E1 = MagneticSensorMT6835(ENC_CS, myMT6835SPISettings);
-InlineCurrentSenseSync CS1 = InlineCurrentSenseSync(0.005, 50, ISENSE_V, ISENSE_U, ISENSE_W);
+InlineCurrentSenseSync CS1 = InlineCurrentSenseSync(0.005f, 50.0f, ISENSE_V, ISENSE_U, ISENSE_W);
+PhaseCurrent_s current1;
 
 // --- EEPROM Data Structure ---
 typedef struct {
@@ -65,6 +67,7 @@ void saveBoardConfig();
 void applySettingsToMotor();
 void runCalibrationSequence();
 void send_param_response(uint8_t param_id, float value);
+void send_characterization_response(float resistance, float inductance);
 
 void setup() {
     pinMode(LED_FAULT, OUTPUT);
@@ -99,7 +102,7 @@ void setup() {
 void loop() {
     M1.loopFOC();
     M1.move();
-
+    current1 = CS1.getPhaseCurrents();
     FDCAN_RxHeaderTypeDef rxHeader;
     uint8_t rxData[8];
     
@@ -135,7 +138,7 @@ void loop() {
                     case REG_VOLTAGE_LIMIT: val = M1.voltage_limit; break;
                     case REG_CURRENT_LIMIT: val = M1.current_limit; break;
                     case REG_VELOCITY_LIMIT: val = M1.velocity_limit; break;
-                    case REG_DRIVER_VOLTAGE_PSU: val = M1.driver->voltage_power_supply; break;
+                    case REG_DRIVER_VOLTAGE_PSU: val = DR1.voltage_power_supply; break;
                     case REG_VOLTAGE_SENSOR_ALIGN: val = M1.voltage_sensor_align; break;
                     case REG_POLE_PAIRS: val = (float)M1.pole_pairs; break;
                     case REG_PHASE_RESISTANCE: val = M1.phase_resistance; break;
@@ -176,12 +179,13 @@ void loop() {
                     case REG_VOLTAGE_LIMIT: M1.voltage_limit = val_f; break;
                     case REG_CURRENT_LIMIT: M1.current_limit = val_f; break;
                     case REG_VELOCITY_LIMIT: M1.velocity_limit = val_f; break;
-                    case REG_DRIVER_VOLTAGE_PSU: M1.driver->voltage_power_supply = val_f; break;
+                    case REG_DRIVER_VOLTAGE_PSU: DR1.voltage_power_supply = val_f; break;
                     case REG_VOLTAGE_SENSOR_ALIGN: M1.voltage_sensor_align = val_f; break;
                     case REG_POLE_PAIRS: M1.pole_pairs = val_8; break;
                     case REG_PHASE_RESISTANCE: M1.phase_resistance = val_f; break;
                     case REG_INDUCTANCE: M1.phase_inductance = val_f; break;
                     case REG_KV: M1.KV_rating = val_f; break;
+                    
                     // Custom Commands
                     case REG_CUSTOM_SAVE_TO_EEPROM: saveBoardConfig(); break;
                     case REG_CUSTOM_FLIP_SENSOR_DIR:
@@ -194,6 +198,11 @@ void loop() {
                         saveBoardConfig();
                         break;
                     case REG_CUSTOM_TELEMETRY_PERIOD: telemetry_period_us = val_32; break;
+                    case REG_CUSTOM_CHARACTERIZE_MOTOR:
+                        // Call the standalone function, passing motor and driver
+                        characteriseMotor(M1, DR1, val_f); 
+                        send_characterization_response(M1.phase_resistance, M1.phase_inductance);
+                        break;
                 }
             }
         }
@@ -300,6 +309,14 @@ void send_param_response(uint8_t param_id, float value) {
     response_data[0] = param_id;
     memcpy(&response_data[1], &value, sizeof(float));
     CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id, response_data, 5);
+}
+
+void send_characterization_response(float resistance, float inductance) {
+    uint8_t response_data[8] = {0};
+    memcpy(&response_data[0], &resistance, sizeof(float));
+    memcpy(&response_data[4], &inductance, sizeof(float));
+    // Use a unique offset (0x80) to distinguish this special response from standard ones
+    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id + 0x80, response_data, 8); 
 }
 
 void runCalibrationSequence() {

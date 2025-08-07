@@ -19,6 +19,7 @@
 #define REG_CUSTOM_SAVE_TO_EEPROM    0xE1
 #define REG_CUSTOM_FLIP_SENSOR_DIR   0xE2
 #define REG_CUSTOM_TELEMETRY_PERIOD  0xE3
+#define REG_CUSTOM_CHARACTERIZE_MOTOR 0xE4 // For motor R and L measurement
 
 // Function Prototypes
 bool CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc);
