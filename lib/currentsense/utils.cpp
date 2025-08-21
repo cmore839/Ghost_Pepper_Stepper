@@ -7,7 +7,7 @@
 #include "opamp.h"
 
 float adcResolution = 4096.0f; // 12 bit ADC
-float voltageScale = 2.9f;     // full scale voltage range of ADC
+float voltageScale = 3.3f;     // full scale voltage range of ADC
 float adcSens =  voltageScale / adcResolution;
 
 volatile uint16_t adc1Result[3] = {0};

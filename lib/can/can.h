@@ -16,10 +16,11 @@
 #define CAN_ID_SCAN_BROADCAST       0x700
 
 // --- Custom Commands (in private range) ---
-#define REG_CUSTOM_SAVE_TO_EEPROM    0xE1
-#define REG_CUSTOM_FLIP_SENSOR_DIR   0xE2
-#define REG_CUSTOM_TELEMETRY_PERIOD  0xE3
-#define REG_CUSTOM_CHARACTERIZE_MOTOR 0xE4 // For motor R and L measurement
+#define REG_CUSTOM_SAVE_TO_EEPROM        0xE1
+#define REG_CUSTOM_FLIP_SENSOR_DIR       0xE2
+#define REG_CUSTOM_TELEMETRY_PERIOD      0xE3
+#define REG_CUSTOM_CHARACTERIZE_MOTOR    0xE4
+#define REG_CUSTOM_SET_ID_AND_RESTART    0xE5 // This is the single, correct command
 
 // Function Prototypes
 bool CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc);

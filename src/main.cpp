@@ -6,31 +6,32 @@
 #include "encoders/mt6835/MagneticSensorMT6835.h"
 #include "InlineCurrentSenseSync.h"
 #include "can.h"
-#include "motor_characterization.h" // Include the new standalone characterization file
 
 // --- Hardware Definitions ---
-// Pin Definitions
 #define ENC_COPI PA7
 #define ENC_CIPO PA6
 #define ENC_CS   PC4
 #define ENC_SCK  PA5
 #define MOT_EN   PB12
-#define MOT_A1   PA0
-#define MOT_A2   PA10
+#define MOT_A1   PA0 //Current sense A1
+#define MOT_A2   PA10 //Current sense A2
 #define MOT_B1   PA9
 #define MOT_B2   PA1
-#define ISENSE_V PA3
-#define ISENSE_U PB13
-#define ISENSE_W PB0
+#define ISENSE_V PA3 //1A - PA3
+#define ISENSE_U PB13 //2A - PB13
+#define ISENSE_W PB0 
 #define LED_FAULT  PB11
 
-// SimpleFOC Objects
+// --- SimpleFOC Objects ---
 BLDCDriver3PWM DR1 = BLDCDriver3PWM(MOT_A1, MOT_A2, MOT_B1, MOT_EN);
 BLDCMotor M1 = BLDCMotor(7);
 SPISettings myMT6835SPISettings(12000000, MT6835_BITORDER, SPI_MODE3);
 MagneticSensorMT6835 E1 = MagneticSensorMT6835(ENC_CS, myMT6835SPISettings);
 InlineCurrentSenseSync CS1 = InlineCurrentSenseSync(0.005f, 50.0f, ISENSE_V, ISENSE_U, ISENSE_W);
 PhaseCurrent_s current1;
+float raw_current_A = 0;
+float raw_current_B = 0;
+float raw_current_C = 0;
 
 // --- EEPROM Data Structure ---
 typedef struct {
@@ -54,7 +55,7 @@ typedef struct {
     float curd_p, curd_i, curd_d, curd_lpf_t;
 } BoardSettings;
 BoardSettings board_config;
-const uint16_t BOARD_CONFIG_SIGNATURE = 0xBEEF;
+const uint16_t BOARD_CONFIG_SIGNATURE = 0xBEED;
 
 // --- Global Variables ---
 uint32_t last_telemetry_time_us = 0;
@@ -67,7 +68,10 @@ void saveBoardConfig();
 void applySettingsToMotor();
 void runCalibrationSequence();
 void send_param_response(uint8_t param_id, float value);
+void send_param_response(uint8_t param_id, uint8_t value);
 void send_characterization_response(float resistance, float inductance);
+void update_config_from_motor();
+void runMotorCharacterization(float voltage);
 
 void setup() {
     pinMode(LED_FAULT, OUTPUT);
@@ -80,29 +84,43 @@ void setup() {
     loadBoardConfig();
     CAN_Init(board_config.can_id);
     
-    E1.init(); M1.linkSensor(&E1); DR1.init(); M1.linkDriver(&DR1); CS1.linkDriver(&DR1); CS1.init(); M1.linkCurrentSense(&CS1);
-    
     applySettingsToMotor();
+
+    E1.init(); 
+    DR1.init();
+    M1.linkSensor(&E1);
+    M1.linkDriver(&DR1);
+
+    SIMPLEFOC_DEBUG("Calibrating current sense...");
+    CS1.linkDriver(&DR1);
+    if(CS1.init() != 1) { 
+        SIMPLEFOC_DEBUG("ERR: CS init failed!");
+        while(1);
+    }
+    M1.linkCurrentSense(&CS1);
+    SIMPLEFOC_DEBUG("...done.");   
     
     M1.foc_modulation = FOCModulationType::SpaceVectorPWM; 
     M1.torque_controller = TorqueControlType::foc_current;
     
     M1.init();
-    
+
     if (!board_config.encoder_calibrated) {
         runCalibrationSequence();
     }
-    
+    //CS1.skip_align = true;
     M1.initFOC();
     M1.disable(); 
-    SIMPLEFOC_DEBUG("Setup complete. Motor ready.");
+    Serial3.print("Setup complete. Motor ready with CAN ID: ");
+    Serial3.println(board_config.can_id);
     digitalWrite(LED_FAULT, LOW);
 }
 
 void loop() {
     M1.loopFOC();
     M1.move();
-    current1 = CS1.getPhaseCurrents();
+    E1.update();
+    E1.getAngle();
     FDCAN_RxHeaderTypeDef rxHeader;
     uint8_t rxData[8];
     
@@ -113,39 +131,39 @@ void loop() {
         else if (rxHeader.Identifier == (CAN_ID_COMMAND_BASE + board_config.can_id)) {
             SimpleFOCRegister reg = (SimpleFOCRegister)rxData[0];
             
-            if (rxHeader.DataLength == 1) { // READ request
-                float val = 0.0f;
+            if (rxHeader.DataLength == 1 && reg != REG_CUSTOM_SAVE_TO_EEPROM && reg != REG_CUSTOM_SET_ID_AND_RESTART) { // READ request
+                float val_f = 0.0f;
                 switch(reg) {
-                    case REG_VEL_PID_P: val = M1.PID_velocity.P; break;
-                    case REG_VEL_PID_I: val = M1.PID_velocity.I; break;
-                    case REG_VEL_PID_D: val = M1.PID_velocity.D; break;
-                    case REG_VEL_PID_LIM: val = M1.PID_velocity.limit; break;
-                    case REG_VEL_PID_RAMP: val = M1.PID_velocity.output_ramp; break;
-                    case REG_VEL_LPF_T: val = M1.LPF_velocity.Tf; break;
-                    case REG_ANG_PID_P: val = M1.P_angle.P; break;
-                    case REG_ANG_PID_I: val = M1.P_angle.I; break;
-                    case REG_ANG_PID_D: val = M1.P_angle.D; break;
-                    case REG_ANG_PID_LIM: val = M1.P_angle.limit; break;
-                    case REG_ANG_PID_RAMP: val = M1.P_angle.output_ramp; break;
-                    case REG_CURQ_PID_P: val = M1.PID_current_q.P; break;
-                    case REG_CURQ_PID_I: val = M1.PID_current_q.I; break;
-                    case REG_CURQ_PID_D: val = M1.PID_current_q.D; break;
-                    case REG_CURQ_LPF_T: val = M1.LPF_current_q.Tf; break;
-                    case REG_CURD_PID_P: val = M1.PID_current_d.P; break;
-                    case REG_CURD_PID_I: val = M1.PID_current_d.I; break;
-                    case REG_CURD_PID_D: val = M1.PID_current_d.D; break;
-                    case REG_CURD_LPF_T: val = M1.LPF_current_d.Tf; break;
-                    case REG_VOLTAGE_LIMIT: val = M1.voltage_limit; break;
-                    case REG_CURRENT_LIMIT: val = M1.current_limit; break;
-                    case REG_VELOCITY_LIMIT: val = M1.velocity_limit; break;
-                    case REG_DRIVER_VOLTAGE_PSU: val = DR1.voltage_power_supply; break;
-                    case REG_VOLTAGE_SENSOR_ALIGN: val = M1.voltage_sensor_align; break;
-                    case REG_POLE_PAIRS: val = (float)M1.pole_pairs; break;
-                    case REG_PHASE_RESISTANCE: val = M1.phase_resistance; break;
-                    case REG_INDUCTANCE: val = M1.phase_inductance; break;
-                    case REG_KV: val = M1.KV_rating; break;
+                    case REG_STATUS: send_param_response(reg, (uint8_t)M1.enabled); break;
+                    case REG_VEL_PID_P: val_f = M1.PID_velocity.P; send_param_response(reg, val_f); break;
+                    case REG_VEL_PID_I: val_f = M1.PID_velocity.I; send_param_response(reg, val_f); break;
+                    case REG_VEL_PID_D: val_f = M1.PID_velocity.D; send_param_response(reg, val_f); break;
+                    case REG_VEL_PID_LIM: val_f = M1.PID_velocity.limit; send_param_response(reg, val_f); break;
+                    case REG_VEL_PID_RAMP: val_f = M1.PID_velocity.output_ramp; send_param_response(reg, val_f); break;
+                    case REG_VEL_LPF_T: val_f = M1.LPF_velocity.Tf; send_param_response(reg, val_f); break;
+                    case REG_ANG_PID_P: val_f = M1.P_angle.P; send_param_response(reg, val_f); break;
+                    case REG_ANG_PID_I: val_f = M1.P_angle.I; send_param_response(reg, val_f); break;
+                    case REG_ANG_PID_D: val_f = M1.P_angle.D; send_param_response(reg, val_f); break;
+                    case REG_ANG_PID_LIM: val_f = M1.P_angle.limit; send_param_response(reg, val_f); break;
+                    case REG_ANG_PID_RAMP: val_f = M1.P_angle.output_ramp; send_param_response(reg, val_f); break;
+                    case REG_CURQ_PID_P: val_f = M1.PID_current_q.P; send_param_response(reg, val_f); break;
+                    case REG_CURQ_PID_I: val_f = M1.PID_current_q.I; send_param_response(reg, val_f); break;
+                    case REG_CURQ_PID_D: val_f = M1.PID_current_q.D; send_param_response(reg, val_f); break;
+                    case REG_CURQ_LPF_T: val_f = M1.LPF_current_q.Tf; send_param_response(reg, val_f); break;
+                    case REG_CURD_PID_P: val_f = M1.PID_current_d.P; send_param_response(reg, val_f); break;
+                    case REG_CURD_PID_I: val_f = M1.PID_current_d.I; send_param_response(reg, val_f); break;
+                    case REG_CURD_PID_D: val_f = M1.PID_current_d.D; send_param_response(reg, val_f); break;
+                    case REG_CURD_LPF_T: val_f = M1.LPF_current_d.Tf; send_param_response(reg, val_f); break;
+                    case REG_VOLTAGE_LIMIT: val_f = M1.voltage_limit; send_param_response(reg, val_f); break;
+                    case REG_CURRENT_LIMIT: val_f = M1.current_limit; send_param_response(reg, val_f); break;
+                    case REG_VELOCITY_LIMIT: val_f = M1.velocity_limit; send_param_response(reg, val_f); break;
+                    case REG_DRIVER_VOLTAGE_PSU: val_f = DR1.voltage_power_supply; send_param_response(reg, val_f); break;
+                    case REG_VOLTAGE_SENSOR_ALIGN: val_f = M1.voltage_sensor_align; send_param_response(reg, val_f); break;
+                    case REG_POLE_PAIRS: val_f = (float)M1.pole_pairs; send_param_response(reg, val_f); break;
+                    case REG_PHASE_RESISTANCE: val_f = M1.phase_resistance; send_param_response(reg, val_f); break;
+                    case REG_INDUCTANCE: val_f = M1.phase_inductance; send_param_response(reg, val_f); break;
+                    case REG_KV: val_f = M1.KV_rating; send_param_response(reg, val_f); break;
                 }
-                send_param_response(reg, val);
             } 
             else { // WRITE request
                 float val_f; uint32_t val_32; uint8_t val_8 = rxData[1];
@@ -156,7 +174,7 @@ void loop() {
                     case REG_TARGET: M1.target = val_f; break;
                     case REG_ENABLE: (val_8 > 0) ? M1.enable() : M1.disable(); break;
                     case REG_CONTROL_MODE: M1.controller = (MotionControlType)val_8; break;
-                    case REG_MOTOR_ADDRESS: board_config.can_id = val_8; CAN_Init(val_8); break;
+                    
                     case REG_VEL_PID_P: M1.PID_velocity.P = val_f; break;
                     case REG_VEL_PID_I: M1.PID_velocity.I = val_f; break;
                     case REG_VEL_PID_D: M1.PID_velocity.D = val_f; break;
@@ -187,21 +205,37 @@ void loop() {
                     case REG_KV: M1.KV_rating = val_f; break;
                     
                     // Custom Commands
-                    case REG_CUSTOM_SAVE_TO_EEPROM: saveBoardConfig(); break;
+                    case REG_CUSTOM_SAVE_TO_EEPROM: 
+                        SIMPLEFOC_DEBUG("Save command received.");
+                        update_config_from_motor();
+                        saveBoardConfig();
+                        break;
                     case REG_CUSTOM_FLIP_SENSOR_DIR:
                         M1.disable();
                         board_config.sensor_direction = (board_config.sensor_direction == Direction::CW) ? Direction::CCW : Direction::CW;
                         board_config.zero_electric_angle = _2PI - board_config.zero_electric_angle;
-                        M1.sensor_direction = board_config.sensor_direction;
-                        M1.zero_electric_angle = board_config.zero_electric_angle;
-                        M1.initFOC();
+                        update_config_from_motor();
                         saveBoardConfig();
+                        M1.initFOC();
                         break;
                     case REG_CUSTOM_TELEMETRY_PERIOD: telemetry_period_us = val_32; break;
                     case REG_CUSTOM_CHARACTERIZE_MOTOR:
-                        // Call the standalone function, passing motor and driver
-                        characteriseMotor(M1, DR1, val_f); 
+                        runMotorCharacterization(val_f); 
                         send_characterization_response(M1.phase_resistance, M1.phase_inductance);
+                        break;
+                    case REG_CUSTOM_SET_ID_AND_RESTART:
+                        if (rxHeader.DataLength == 2) {
+                            uint8_t new_id = rxData[1];
+                            Serial3.print("Received command to set new ID to ");
+                            Serial3.print(new_id);
+                            Serial3.println(" and restart.");
+                            board_config.can_id = new_id;
+                            update_config_from_motor(); 
+                            saveBoardConfig();          
+                            Serial3.println("Config saved. Restarting MCU now.");
+                            delay(100);                 
+                            NVIC_SystemReset();
+                        }
                         break;
                 }
             }
@@ -215,8 +249,112 @@ void loop() {
     }
 }
 
-void saveBoardConfig(){
-    SIMPLEFOC_DEBUG("Saving all parameters to EEPROM...");
+void runMotorCharacterization(float voltage) {
+    // This value is now used to calibrate the current sense reading.
+    const float CURRENT_SENSE_CORRECTION_FACTOR = 1.0f; 
+
+    if (!CS1.initialized) {
+        Serial3.println(F("ERR: MOT: Cannot characterise motor: CS not initialized"));
+        return;
+    }
+
+    if (voltage <= 0.0f){
+        Serial3.println(F("ERR: MOT: Voltage is negative or less than zero"));
+        return;
+    }
+    voltage = _constrain(voltage, 0.0f, M1.voltage_limit);
+    
+    Serial3.println(F("MOT: Measuring phase resistance (direct PWM on Phase B)..."));
+    
+    // 1. Measure zero-current offset
+    DR1.setPwm(0, 0, 0);
+    DR1.disable();
+    _delay(2000); 
+    float current_offset_B = 0;
+    for (int i = 0; i < 100; i++) {
+        current_offset_B += CS1.getPhaseCurrents().b;
+        _delay(1);
+    }
+    current_offset_B /= 100.0f;
+    
+    Serial3.print(F("MOT-DEBUG: Measured current offset B: "));
+    Serial3.print(current_offset_B, 4);
+    Serial3.println(F(" A"));
+
+    // 2. Apply voltage and measure current
+    DR1.enable();
+    DR1.setPwm(0, voltage, -voltage); 
+    _delay(1000);
+     
+    for (int i = 0; i < 100; i++) {
+        raw_current_A += CS1.getPhaseCurrents().a;
+        raw_current_B += CS1.getPhaseCurrents().b;
+        raw_current_C += CS1.getPhaseCurrents().c;
+        _delay(5);
+    }
+    raw_current_C /= 100.0f;
+    raw_current_B /= 100.0f;
+    raw_current_A /= 100.0f;
+    _delay(1000);
+
+    DR1.setPwm(0, 0, 0);
+    _delay(200);
+    DR1.disable();
+
+    Serial3.print(F("MOT-DEBUG: Raw current B under load: "));
+    Serial3.print(raw_current_B, 4);
+    Serial3.println(F(" A"));
+
+    // 3. Calculate resistance
+    float true_current_B = (raw_current_B - current_offset_B) * CURRENT_SENSE_CORRECTION_FACTOR;
+    
+    Serial3.print(F("MOT-DEBUG: Corrected current B: "));
+    Serial3.print(true_current_B, 4);
+    Serial3.println(F(" A"));
+
+    if (fabsf(true_current_B) < 0.01f) { 
+        Serial3.println(F("ERR: MOT: Motor characterisation failed: corrected current too low"));
+        return;
+    }
+    
+    float terminal_resistance = voltage / true_current_B;
+    M1.phase_resistance = terminal_resistance / 2.0f;
+    
+    Serial3.print(F("MOT: Estimated phase resistance: "));
+    Serial3.print(M1.phase_resistance, 4);
+    Serial3.println(F(" Ohms"));
+    _delay(100);
+
+    // 4. Measure Inductance using the time-constant method
+    Serial3.println(F("MOT: Measuring phase inductance (time constant method on Phase B)..."));
+    long t_start = _micros();
+    DR1.enable();
+    DR1.setPwm(0, voltage, 0);
+    while(_micros() - t_start < 1000000) { 
+        PhaseCurrent_s current_check = CS1.getPhaseCurrents();
+        if (abs((current_check.b - current_offset_B) * CURRENT_SENSE_CORRECTION_FACTOR) > 0.632f * (voltage / terminal_resistance)) {
+            break;
+        }
+    }
+    long t_end = _micros();
+    DR1.setPwm(0, 0, 0);
+    DR1.disable();
+
+    float time_constant = (t_end - t_start) * 1e-6f;
+    M1.phase_inductance = terminal_resistance * time_constant;
+
+    Serial3.print(F("MOT: Measured L: "));
+    Serial3.print(M1.phase_inductance, 6);
+    Serial3.println(F(" H"));
+
+    Serial3.println(F("MOT: Characterization complete."));
+    raw_current_A = 0;
+    raw_current_B = 0;
+    raw_current_C = 0;
+}
+
+void update_config_from_motor() {
+    SIMPLEFOC_DEBUG("Syncing motor state to config struct...");
     board_config.sensor_direction = M1.sensor_direction;
     board_config.zero_electric_angle = M1.zero_electric_angle;
     board_config.pole_pairs = M1.pole_pairs;
@@ -236,9 +374,13 @@ void saveBoardConfig(){
     board_config.curq_lpf_t = M1.LPF_current_q.Tf;
     board_config.curd_p = M1.PID_current_d.P; board_config.curd_i = M1.PID_current_d.I; board_config.curd_d = M1.PID_current_d.D;
     board_config.curd_lpf_t = M1.LPF_current_d.Tf;
-    
+}
+
+void saveBoardConfig(){
+    Serial3.print("Saving config to EEPROM. CAN ID will be: ");
+    Serial3.println(board_config.can_id);
     EEPROM.put(0, board_config);
-    delay(10);
+    delay(20); 
     SIMPLEFOC_DEBUG("Save complete.");
 }
 
@@ -250,13 +392,13 @@ void loadBoardConfig(){
         board_config.can_id = 1;
         board_config.encoder_calibrated = 0;
         board_config.pole_pairs = 7;
-        board_config.phase_resistance = 0.6f;
-        board_config.phase_inductance = 0.0015f;
-        board_config.kv_rating = 360;
-        board_config.voltage_limit = 8.0f;
+        board_config.phase_resistance = 0.0f;
+        board_config.phase_inductance = 0.0f;
+        board_config.kv_rating = 0.0f;
+        board_config.voltage_limit = 1.0f;
         board_config.current_limit = 1.0f;
         board_config.velocity_limit = 50.0f;
-        board_config.driver_voltage_psu = 12.0f;
+        board_config.driver_voltage_psu = 8.0f;
         board_config.voltage_sensor_align = 2.0f;
         board_config.vel_p = 0.2f; board_config.vel_i = 2.0f; board_config.vel_d = 0.0f;
         board_config.vel_lim = 10.0f; board_config.vel_ramp = 1000.0f; board_config.vel_lpf_t = 0.01f;
@@ -279,6 +421,9 @@ void applySettingsToMotor() {
     M1.current_limit = board_config.current_limit;
     M1.velocity_limit = board_config.velocity_limit;
     DR1.voltage_power_supply = board_config.driver_voltage_psu;
+    // DR1.pwm_frequency = 20000; // PWM frequency
+    // DR1.voltage_power_supply = 4.0f; // Set PSU voltage
+    // DR1.voltage_limit = 4.0f;
     M1.voltage_sensor_align = board_config.voltage_sensor_align;
     M1.PID_velocity.P = board_config.vel_p; M1.PID_velocity.I = board_config.vel_i; M1.PID_velocity.D = board_config.vel_d;
     M1.PID_velocity.limit = board_config.vel_lim; M1.PID_velocity.output_ramp = board_config.vel_ramp;
@@ -308,23 +453,31 @@ void send_param_response(uint8_t param_id, float value) {
     uint8_t response_data[5] = {0};
     response_data[0] = param_id;
     memcpy(&response_data[1], &value, sizeof(float));
-    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id, response_data, 5);
+    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id, response_data, FDCAN_DLC_BYTES_5);
 }
+
+void send_param_response(uint8_t param_id, uint8_t value) {
+    uint8_t response_data[2] = {0};
+    response_data[0] = param_id;
+    response_data[1] = value;
+    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id, response_data, FDCAN_DLC_BYTES_2);
+}
+
 
 void send_characterization_response(float resistance, float inductance) {
     uint8_t response_data[8] = {0};
     memcpy(&response_data[0], &resistance, sizeof(float));
     memcpy(&response_data[4], &inductance, sizeof(float));
-    // Use a unique offset (0x80) to distinguish this special response from standard ones
-    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id + 0x80, response_data, 8); 
+    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id + 0x80, response_data, FDCAN_DLC_BYTES_8); 
 }
 
 void runCalibrationSequence() {
     SIMPLEFOC_DEBUG("Starting calibration...");
+    M1.zero_electric_angle = NOT_SET;
+    M1.sensor_direction = Direction::UNKNOWN;
     M1.initFOC();
     board_config.encoder_calibrated = 1;
-    board_config.sensor_direction = M1.sensor_direction;
-    board_config.zero_electric_angle = M1.zero_electric_angle;
+    update_config_from_motor();
     saveBoardConfig();
     SIMPLEFOC_DEBUG("Calibration complete.");
 }
