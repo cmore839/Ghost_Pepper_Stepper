@@ -5,6 +5,22 @@
 static FDCAN_HandleTypeDef hfdcan1;
 static FDCAN_TxHeaderTypeDef TxHeader;
 
+// Helper function to convert byte count to the required HAL DLC enum
+static uint32_t bytesToDLC(uint8_t bytes) {
+    switch (bytes) {
+        case 0: return FDCAN_DLC_BYTES_0;
+        case 1: return FDCAN_DLC_BYTES_1;
+        case 2: return FDCAN_DLC_BYTES_2;
+        case 3: return FDCAN_DLC_BYTES_3;
+        case 4: return FDCAN_DLC_BYTES_4;
+        case 5: return FDCAN_DLC_BYTES_5;
+        case 6: return FDCAN_DLC_BYTES_6;
+        case 7: return FDCAN_DLC_BYTES_7;
+        case 8: return FDCAN_DLC_BYTES_8;
+        default: return FDCAN_DLC_BYTES_8; // Default to 8 for safety
+    }
+}
+
 void CAN_Init(uint8_t can_id) {
     SIMPLEFOC_DEBUG("CAN: Initializing FDCAN peripheral...");
     hfdcan1.Instance = FDCAN1;
@@ -24,7 +40,7 @@ void CAN_Init(uint8_t can_id) {
     hfdcan1.Init.DataTimeSeg1 = 15;
     hfdcan1.Init.DataTimeSeg2 = 8;
 
-    hfdcan1.Init.StdFiltersNbr = 1;
+    hfdcan1.Init.StdFiltersNbr = 2; 
     hfdcan1.Init.ExtFiltersNbr = 0;
     hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
 
@@ -38,6 +54,11 @@ void CAN_Init(uint8_t can_id) {
     sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
     sFilterConfig.FilterID1 = CAN_ID_COMMAND_BASE + can_id;
     sFilterConfig.FilterID2 = CAN_ID_SCAN_BROADCAST;
+    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) Error_Handler();
+
+    sFilterConfig.FilterIndex = 1;
+    sFilterConfig.FilterID1 = CAN_ID_MOTION_COMMAND_BASE + can_id;
+    sFilterConfig.FilterID2 = CAN_ID_SYNC;
     if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) Error_Handler();
 
     if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK) Error_Handler();
@@ -56,7 +77,7 @@ bool CAN_Poll(FDCAN_RxHeaderTypeDef* rxHeader, uint8_t* rxData) {
     return false;
 }
 
-bool CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc) {
+bool CAN_Send(uint16_t id, uint8_t* data, uint8_t dlc_bytes) {
     if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) {
         return false;
     }
@@ -64,7 +85,7 @@ bool CAN_Send(uint16_t id, uint8_t* data, uint32_t dlc) {
     TxHeader.Identifier = id;
     TxHeader.IdType = FDCAN_STANDARD_ID;
     TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    TxHeader.DataLength = dlc; // This now works because main.cpp will pass the correct HAL enum
+    TxHeader.DataLength = bytesToDLC(dlc_bytes); // Use the helper function
     TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
     TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
     TxHeader.FDFormat = FDCAN_CLASSIC_CAN;

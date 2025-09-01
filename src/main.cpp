@@ -13,12 +13,12 @@
 #define ENC_CS   PC4
 #define ENC_SCK  PA5
 #define MOT_EN   PB12
-#define MOT_A1   PA0 //Current sense A1
-#define MOT_A2   PA10 //Current sense A2
+#define MOT_A1   PA0 
+#define MOT_A2   PA10
 #define MOT_B1   PA9
 #define MOT_B2   PA1
-#define ISENSE_V PA3 //1A - PA3
-#define ISENSE_U PB13 //2A - PB13
+#define ISENSE_V PA3 
+#define ISENSE_U PB13
 #define ISENSE_W PB0 
 #define LED_FAULT  PB11
 
@@ -60,6 +60,31 @@ const uint16_t BOARD_CONFIG_SIGNATURE = 0xBEED;
 // --- Global Variables ---
 uint32_t last_telemetry_time_us = 0;
 uint32_t telemetry_period_us = 10000;
+uint32_t last_status_time_us = 0;
+uint32_t status_period_us = 50000; // 20Hz
+
+// --- State Machine ---
+enum MotorState {
+    INITIALIZING,
+    READY,
+    OPERATIONAL,
+    FAULT
+};
+MotorState current_state = INITIALIZING;
+
+// --- Motion Command Buffer ---
+struct MotionCommand {
+    float position;
+    float velocity;
+    float acceleration;
+};
+MotionCommand motion_command_buffer;
+volatile bool new_motion_command = false;
+
+// --- Feedforward Gains ---
+float K_ff_vel = 1.0;
+float K_ff_accel = 0.0; 
+
 
 // --- Function Prototypes ---
 void sendPackedTelemetry();
@@ -72,6 +97,8 @@ void send_param_response(uint8_t param_id, uint8_t value);
 void send_characterization_response(float resistance, float inductance);
 void update_config_from_motor();
 void runMotorCharacterization(float voltage);
+void sendStatusFeedback();
+
 
 void setup() {
     pinMode(LED_FAULT, OUTPUT);
@@ -95,43 +122,79 @@ void setup() {
     CS1.linkDriver(&DR1);
     if(CS1.init() != 1) { 
         SIMPLEFOC_DEBUG("ERR: CS init failed!");
+        current_state = FAULT;
         while(1);
     }
     M1.linkCurrentSense(&CS1);
     SIMPLEFOC_DEBUG("...done.");   
     
     M1.foc_modulation = FOCModulationType::SpaceVectorPWM; 
-    M1.torque_controller = TorqueControlType::foc_current;
+    M1.torque_controller = TorqueControlType::foc_current; 
     
     M1.init();
 
     if (!board_config.encoder_calibrated) {
         runCalibrationSequence();
     }
-    //CS1.skip_align = true;
+    
     M1.initFOC();
     M1.disable(); 
     Serial3.print("Setup complete. Motor ready with CAN ID: ");
     Serial3.println(board_config.can_id);
     digitalWrite(LED_FAULT, LOW);
+    
+    current_state = READY;
 }
 
 void loop() {
-    M1.loopFOC();
-    M1.move();
+    if (current_state == FAULT) {
+        digitalWrite(LED_FAULT, HIGH);
+        return;
+    }
+
     E1.update();
-    E1.getAngle();
+   
+    M1.move();
+    M1.loopFOC();
+
     FDCAN_RxHeaderTypeDef rxHeader;
     uint8_t rxData[8];
     
-    if (CAN_Poll(&rxHeader, rxData)) {
+    if (CAN_Poll(&rxHeader, &rxData[0])) {
         if (rxHeader.Identifier == CAN_ID_SCAN_BROADCAST) {
             sendPackedTelemetry();
+        } else if (rxHeader.Identifier == (CAN_ID_MOTION_COMMAND_BASE + board_config.can_id)) {
+            if (rxHeader.DataLength >= 8) { 
+                int32_t pos_raw;
+                // --- FIX: Revert vel_raw and acc_raw to 16-bit integers ---
+                int16_t vel_raw;
+                int16_t acc_raw;
+                
+                // Unpack the 8-byte message
+                memcpy(&pos_raw, &rxData[0], sizeof(int32_t));
+                memcpy(&vel_raw, &rxData[4], sizeof(int16_t)); 
+                memcpy(&acc_raw, &rxData[6], sizeof(int16_t));
+                
+                // --- FIX: Use the new corresponding scaling factors ---
+                motion_command_buffer.position = pos_raw * 0.0001f; 
+                motion_command_buffer.velocity = vel_raw * 0.01f;     // Changed from 0.001
+                motion_command_buffer.acceleration = acc_raw * 0.1f;  // Changed from 0.01
+                
+                new_motion_command = true;
+            }
+        } else if (rxHeader.Identifier == CAN_ID_SYNC) {
+            Serial3.printf("SYNC received. Motor enabled: %d, State: %d", M1.enabled, current_state);
+            // SYNC now simply means "make sure you're running"
+            if (M1.enabled && current_state == READY) {
+                M1.controller = MotionControlType::angle;
+                current_state = OPERATIONAL;
+                SIMPLEFOC_DEBUG("State -> OPERATIONAL");
+            }
         }
         else if (rxHeader.Identifier == (CAN_ID_COMMAND_BASE + board_config.can_id)) {
             SimpleFOCRegister reg = (SimpleFOCRegister)rxData[0];
             
-            if (rxHeader.DataLength == 1 && reg != REG_CUSTOM_SAVE_TO_EEPROM && reg != REG_CUSTOM_SET_ID_AND_RESTART) { // READ request
+            if (rxHeader.DataLength == 1 && reg < 0xE0) { 
                 float val_f = 0.0f;
                 switch(reg) {
                     case REG_STATUS: send_param_response(reg, (uint8_t)M1.enabled); break;
@@ -171,10 +234,24 @@ void loop() {
                 if (rxHeader.DataLength >= 5) memcpy(&val_32, &rxData[1], sizeof(uint32_t));
 
                 switch(reg) {
-                    case REG_TARGET: M1.target = val_f; break;
-                    case REG_ENABLE: (val_8 > 0) ? M1.enable() : M1.disable(); break;
+                    case REG_TARGET: 
+                        // For manual control, set the target and zero out the feedforward terms
+                        M1.target = val_f;
+                        M1.velocity_ff = 0.0f;
+                        M1.acceleration_ff = 0.0f;
+                        break;
+                    case REG_ENABLE: 
+                        if (val_8 > 0) {
+                            M1.enable();
+                            current_state = READY;
+                            SIMPLEFOC_DEBUG("Motor ENABLED. State -> READY");
+                        } else {
+                            M1.disable();
+                            current_state = READY;
+                            SIMPLEFOC_DEBUG("Motor DISABLED. State -> READY");
+                        }
+                        break;
                     case REG_CONTROL_MODE: M1.controller = (MotionControlType)val_8; break;
-                    
                     case REG_VEL_PID_P: M1.PID_velocity.P = val_f; break;
                     case REG_VEL_PID_I: M1.PID_velocity.I = val_f; break;
                     case REG_VEL_PID_D: M1.PID_velocity.D = val_f; break;
@@ -242,19 +319,37 @@ void loop() {
         }
     }
 
+    // ================== FIX STARTS HERE ==================
+    // This is the missing logic block to process the motion command buffer.
+    if (new_motion_command) {
+        // Only apply the new command if the motor is in the OPERATIONAL state
+        if (current_state == OPERATIONAL) {
+            M1.target = motion_command_buffer.position;
+            M1.velocity_ff = K_ff_vel * motion_command_buffer.velocity;
+            M1.acceleration_ff = K_ff_accel * motion_command_buffer.acceleration;
+        }
+        // Reset the flag so this command isn't processed again
+        new_motion_command = false;
+    }
+    // =================== FIX ENDS HERE ===================
+
     unsigned long now = micros();
     if (telemetry_period_us > 0 && (now - last_telemetry_time_us > telemetry_period_us)) {
         last_telemetry_time_us = now;
         sendPackedTelemetry();
     }
+    if (status_period_us > 0 && (now - last_status_time_us > status_period_us)) {
+        last_status_time_us = now;
+        sendStatusFeedback();
+    }
 }
 
 void runMotorCharacterization(float voltage) {
-    // This value is now used to calibrate the current sense reading.
     const float CURRENT_SENSE_CORRECTION_FACTOR = 1.0f; 
 
     if (!CS1.initialized) {
         Serial3.println(F("ERR: MOT: Cannot characterise motor: CS not initialized"));
+        current_state = FAULT;
         return;
     }
 
@@ -264,8 +359,8 @@ void runMotorCharacterization(float voltage) {
     }
     voltage = _constrain(voltage, 0.0f, M1.voltage_limit);
     
-    Serial3.println(F("MOT: Measuring phase resistance (direct PWM on Phase B)..."));
-    
+    Serial3.println(F("MOT: Measuring phase resistance..."));
+
     // 1. Measure zero-current offset
     DR1.setPwm(0, 0, 0);
     DR1.disable();
@@ -276,12 +371,12 @@ void runMotorCharacterization(float voltage) {
         _delay(1);
     }
     current_offset_B /= 100.0f;
-    
+
     Serial3.print(F("MOT-DEBUG: Measured current offset B: "));
     Serial3.print(current_offset_B, 4);
     Serial3.println(F(" A"));
 
-    // 2. Apply voltage and measure current
+    // 2. Apply voltage and measure current    
     DR1.enable();
     DR1.setPwm(0, voltage, -voltage); 
     _delay(1000);
@@ -296,7 +391,7 @@ void runMotorCharacterization(float voltage) {
     raw_current_B /= 100.0f;
     raw_current_A /= 100.0f;
     _delay(1000);
-
+    
     DR1.setPwm(0, 0, 0);
     _delay(200);
     DR1.disable();
@@ -311,9 +406,10 @@ void runMotorCharacterization(float voltage) {
     Serial3.print(F("MOT-DEBUG: Corrected current B: "));
     Serial3.print(true_current_B, 4);
     Serial3.println(F(" A"));
-
+    
     if (fabsf(true_current_B) < 0.01f) { 
         Serial3.println(F("ERR: MOT: Motor characterisation failed: corrected current too low"));
+        current_state = FAULT;
         return;
     }
     
@@ -325,8 +421,7 @@ void runMotorCharacterization(float voltage) {
     Serial3.println(F(" Ohms"));
     _delay(100);
 
-    // 4. Measure Inductance using the time-constant method
-    Serial3.println(F("MOT: Measuring phase inductance (time constant method on Phase B)..."));
+    Serial3.println(F("MOT: Measuring phase inductance..."));
     long t_start = _micros();
     DR1.enable();
     DR1.setPwm(0, voltage, 0);
@@ -421,9 +516,6 @@ void applySettingsToMotor() {
     M1.current_limit = board_config.current_limit;
     M1.velocity_limit = board_config.velocity_limit;
     DR1.voltage_power_supply = board_config.driver_voltage_psu;
-    // DR1.pwm_frequency = 20000; // PWM frequency
-    // DR1.voltage_power_supply = 4.0f; // Set PSU voltage
-    // DR1.voltage_limit = 4.0f;
     M1.voltage_sensor_align = board_config.voltage_sensor_align;
     M1.PID_velocity.P = board_config.vel_p; M1.PID_velocity.I = board_config.vel_i; M1.PID_velocity.D = board_config.vel_d;
     M1.PID_velocity.limit = board_config.vel_lim; M1.PID_velocity.output_ramp = board_config.vel_ramp;
@@ -439,36 +531,49 @@ void applySettingsToMotor() {
 }
 
 void sendPackedTelemetry() {
-    uint8_t tx_data[8] = {0};
-    int32_t angle_raw = (int32_t)(M1.shaft_angle / 0.0001f);
+    uint8_t tx_data[8];
+    int32_t angle_raw = (int32_t)(M1.shaft_angle * 10000.0f);
     memcpy(&tx_data[0], &angle_raw, sizeof(int32_t));
-    int16_t velocity_raw = (int16_t)(M1.shaft_velocity / 0.01f);
+    int16_t velocity_raw = (int16_t)(M1.shaft_velocity * 100.0f);
     memcpy(&tx_data[4], &velocity_raw, sizeof(int16_t));
-    int16_t current_q_raw = (int16_t)(M1.current.q / 0.001f);
+    int16_t current_q_raw = (int16_t)(M1.current.q * 1000.0f);
     memcpy(&tx_data[6], &current_q_raw, sizeof(int16_t));
-    CAN_Send(CAN_ID_TELEMETRY_BASE + board_config.can_id, tx_data, FDCAN_DLC_BYTES_8);
+    CAN_Send(CAN_ID_TELEMETRY_BASE + board_config.can_id, tx_data, 8);
 }
 
 void send_param_response(uint8_t param_id, float value) {
-    uint8_t response_data[5] = {0};
+    uint8_t response_data[5];
     response_data[0] = param_id;
     memcpy(&response_data[1], &value, sizeof(float));
-    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id, response_data, FDCAN_DLC_BYTES_5);
+    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id, response_data, 5);
 }
 
 void send_param_response(uint8_t param_id, uint8_t value) {
-    uint8_t response_data[2] = {0};
+    uint8_t response_data[2];
     response_data[0] = param_id;
     response_data[1] = value;
-    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id, response_data, FDCAN_DLC_BYTES_2);
+    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id, response_data, 2);
 }
 
-
 void send_characterization_response(float resistance, float inductance) {
-    uint8_t response_data[8] = {0};
+    uint8_t response_data[8];
     memcpy(&response_data[0], &resistance, sizeof(float));
     memcpy(&response_data[4], &inductance, sizeof(float));
-    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id + 0x80, response_data, FDCAN_DLC_BYTES_8); 
+    CAN_Send(CAN_ID_RESPONSE_BASE + board_config.can_id + 0x80, response_data, 8); 
+}
+
+void sendStatusFeedback() {
+    uint8_t tx_data[8];
+    int32_t angle_raw = (int32_t)(M1.shaft_angle * 10000);
+    memcpy(&tx_data[0], &angle_raw, sizeof(int32_t));
+    int16_t velocity_raw = (int16_t)(M1.shaft_velocity * 100);
+    memcpy(&tx_data[4], &velocity_raw, sizeof(int16_t));
+    uint8_t status_flags = 0;
+    if (M1.enabled) status_flags |= 0x01;
+    if (current_state == FAULT) status_flags |= 0x02;
+    tx_data[6] = status_flags;
+    tx_data[7] = (uint8_t)current_state;
+    CAN_Send(CAN_ID_STATUS_FEEDBACK_BASE + board_config.can_id, tx_data, 8);
 }
 
 void runCalibrationSequence() {

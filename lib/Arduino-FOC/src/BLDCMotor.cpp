@@ -379,73 +379,70 @@ void BLDCMotor::move(float new_target) {
   if(motion_cnt++ < motion_downsample) return;
   motion_cnt = 0;
 
-  // shaft angle/velocity need the update() to be called first
-  // get shaft angle
-  // TODO sensor precision: the shaft_angle actually stores the complete position, including full rotations, as a float
-  //                        For this reason it is NOT precise when the angles become large.
-  //                        Additionally, the way LPF works on angle is a precision issue, and the angle-LPF is a problem
-  //                        when switching to a 2-component representation.
   if( controller!=MotionControlType::angle_openloop && controller!=MotionControlType::velocity_openloop ) 
-    shaft_angle = shaftAngle(); // read value even if motor is disabled to keep the monitoring updated but not in openloop mode
-  // get angular velocity  TODO the velocity reading probably also shouldn't happen in open loop modes?
-  shaft_velocity = shaftVelocity(); // read value even if motor is disabled to keep the monitoring updated
+    shaft_angle = shaftAngle(); 
+  shaft_velocity = shaftVelocity(); 
 
-  // if disabled do nothing
   if(!enabled) return;
-  // set internal target variable
   if(_isset(new_target)) target = new_target;
   
-  // calculate the back-emf voltage if KV_rating available U_bemf = vel*(1/KV)
   if (_isset(KV_rating)) voltage_bemf = shaft_velocity/KV_rating/_RPM_TO_RADS;
-  // estimate the motor current if phase reistance available and current_sense not available
   if(!current_sense && _isset(phase_resistance)) current.q = (voltage.q - voltage_bemf)/phase_resistance;
 
-  // upgrade the current based voltage limit
   switch (controller) {
     case MotionControlType::torque:
-      if(torque_controller == TorqueControlType::voltage){ // if voltage torque control
+      if(torque_controller == TorqueControlType::voltage){ 
         if(!_isset(phase_resistance))  voltage.q = target;
         else  voltage.q =  target*phase_resistance + voltage_bemf;
         voltage.q = _constrain(voltage.q, -voltage_limit, voltage_limit);
-        // set d-component (lag compensation if known inductance)
         if(!_isset(phase_inductance)) voltage.d = 0;
         else voltage.d = _constrain( -target*shaft_velocity*pole_pairs*phase_inductance, -voltage_limit, voltage_limit);
       }else{
-        current_sp = target; // if current/foc_current torque control
+        current_sp = target; 
       }
       break;
-    case MotionControlType::angle:
-      // TODO sensor precision: this calculation is not numerically precise. The target value cannot express precise positions when
-      //                        the angles are large. This results in not being able to command small changes at high position values.
-      //                        to solve this, the delta-angle has to be calculated in a numerically precise way.
-      // angle set point
-      shaft_angle_sp = target;
-      // calculate velocity set point
-      shaft_velocity_sp = feed_forward_velocity + P_angle( shaft_angle_sp - shaft_angle );
-      shaft_angle_sp = _constrain(shaft_angle_sp,-velocity_limit, velocity_limit);
-      // calculate the torque command - sensor precision: this calculation is ok, but based on bad value from previous calculation
-      current_sp = PID_velocity(shaft_velocity_sp - shaft_velocity); // if voltage torque control
-      // if torque controlled through voltage
-      if(torque_controller == TorqueControlType::voltage){
-        // use voltage if phase-resistance not provided
-        if(!_isset(phase_resistance))  voltage.q = current_sp;
-        else  voltage.q =  _constrain( current_sp*phase_resistance + voltage_bemf , -voltage_limit, voltage_limit);
-        // set d-component (lag compensation if known inductance)
-        if(!_isset(phase_inductance)) voltage.d = 0;
-        else voltage.d = _constrain( -current_sp*shaft_velocity*pole_pairs*phase_inductance, -voltage_limit, voltage_limit);
-      }
-      break;
+
+case MotionControlType::angle:
+    // Position control loop calculates a corrective velocity
+    shaft_velocity_sp = P_angle(target - shaft_angle);
+
+    // Velocity control loop calculates a corrective torque/current
+    // The error is the difference between the desired velocity (vel_ff) and actual velocity,
+    // plus the corrective velocity from the position loop.
+    current_sp = PID_velocity((velocity_ff + shaft_velocity_sp) - shaft_velocity);
+
+    if (torque_controller == TorqueControlType::foc_current) {
+        // For current control, the final command is the sum of:
+        // 1. The corrective torque from the PID loops
+        // 2. The predictive torque from the acceleration feedforward
+        current_sp += acceleration_ff;
+    } 
+    else { // This block handles voltage control
+        // For voltage control, the final command is the sum of:
+        // 1. Voltage to overcome back-EMF at the target velocity
+        float voltage_bemf = velocity_ff / KV_rating / _RPM_TO_RADS;
+        
+        // 2. Voltage to produce the desired acceleration
+        float voltage_accel = acceleration_ff * phase_resistance;
+
+        // 3. Corrective voltage from the PID loops
+        float voltage_correction = current_sp * phase_resistance;
+
+        voltage.q = voltage_bemf + voltage_accel + voltage_correction;
+        voltage.q = _constrain(voltage.q, -voltage_limit, voltage_limit);
+        voltage.d = 0;
+    }
+    break;
+
     case MotionControlType::velocity:
-      // velocity set point - sensor precision: this calculation is numerically precise.
       shaft_velocity_sp = target;
-      // calculate the torque command
-      current_sp = PID_velocity(shaft_velocity_sp - shaft_velocity); // if current/foc_current torque control
-      // if torque controlled through voltage control
+      
+      // *** THE FIX: Add acceleration feedforward to the velocity loop output ***
+      current_sp = PID_velocity(shaft_velocity_sp - shaft_velocity) + acceleration_ff;
+
       if(torque_controller == TorqueControlType::voltage){
-        // use voltage if phase-resistance not provided
         if(!_isset(phase_resistance))  voltage.q = current_sp;
         else  voltage.q = _constrain( current_sp*phase_resistance + voltage_bemf , -voltage_limit, voltage_limit);
-        // set d-component (lag compensation if known inductance)
         if(!_isset(phase_inductance)) voltage.d = 0;
         else voltage.d = _constrain( -current_sp*shaft_velocity*pole_pairs*phase_inductance, -voltage_limit, voltage_limit);
       }

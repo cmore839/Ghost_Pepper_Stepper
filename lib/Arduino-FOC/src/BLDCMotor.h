@@ -26,22 +26,20 @@ class BLDCMotor: public FOCMotor
     
     /**
      * Function linking a motor and a foc driver 
-     * 
-     * @param driver BLDCDriver class implementing all the hardware specific functions necessary PWM setting
+     * * @param driver BLDCDriver class implementing all the hardware specific functions necessary PWM setting
      */
     virtual void linkDriver(BLDCDriver* driver);
 
-    /** 
-      * BLDCDriver link:
+    /** * BLDCDriver link:
       * - 3PWM 
       * - 6PWM 
     */
     BLDCDriver* driver; 
     
-    /**  Motor hardware init function */
-  	void init() override;
+    /** Motor hardware init function */
+    void init() override;
     /** Motor disable function */
-  	void disable() override;
+    void disable() override;
     /** Motor enable function */
     void enable() override;
 
@@ -60,26 +58,31 @@ class BLDCMotor: public FOCMotor
 
     /**
      * Function executing the control loops set by the controller parameter of the BLDCMotor.
-     * 
-     * @param target  Either voltage, angle or velocity based on the motor.controller
-     *                If it is not set the motor will use the target set in its variable motor.target
-     * 
-     * This function doesn't need to be run upon each loop execution - depends of the use case
+     * * @param target  Either voltage, angle or velocity based on the motor.controller
+     * If it is not set the motor will use the target set in its variable motor.target
+     * * This function doesn't need to be run upon each loop execution - depends of the use case
      */
     void move(float target = NOT_SET) override;
     
     float Ua, Ub, Uc;//!< Current phase voltages Ua,Ub and Uc set to motor
-    float	Ualpha, Ubeta; //!< Phase voltages U alpha and U beta used for inverse Park and Clarke transform
+    float Ualpha, Ubeta; //!< Phase voltages U alpha and U beta used for inverse Park and Clarke transform
 
-  /**
+    /**
     * Method using FOC to set Uq to the motor at the optimal angle
     * Heart of the FOC algorithm
-    * 
-    * @param Uq Current voltage in q axis to set to the motor
+    * * @param Uq Current voltage in q axis to set to the motor
     * @param Ud Current voltage in d axis to set to the motor
     * @param angle_el current electrical angle of the motor
     */
     void setPhaseVoltage(float Uq, float Ud, float angle_el) override;
+
+    // target value
+    float target;
+
+    // ADD THESE TWO LINES
+    float velocity_ff;
+    float acceleration_ff;
+
 
   private:
     // FOC methods 
@@ -96,15 +99,13 @@ class BLDCMotor: public FOCMotor
     /**
      * Function (iterative) generating open loop movement for target velocity
      * it uses voltage_limit variable
-     * 
-     * @param target_velocity - rad/s
+     * * @param target_velocity - rad/s
      */
     float velocityOpenloop(float target_velocity);
     /**
      * Function (iterative) generating open loop movement towards the target angle
      * it uses voltage_limit and velocity_limit variables
-     * 
-     * @param target_angle - rad
+     * * @param target_angle - rad
      */
     float angleOpenloop(float target_angle);
     // open loop variables
