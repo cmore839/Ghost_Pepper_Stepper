@@ -6,6 +6,7 @@
 #include "encoders/mt6835/MagneticSensorMT6835.h"
 #include "InlineCurrentSenseSync.h"
 #include "can.h"
+#include "Trajectory.h" 
 
 // --- Hardware Definitions ---
 #define ENC_COPI PA7
@@ -13,13 +14,13 @@
 #define ENC_CS   PC4
 #define ENC_SCK  PA5
 #define MOT_EN   PB12
-#define MOT_A1   PA0 
+#define MOT_A1   PA0
 #define MOT_A2   PA10
 #define MOT_B1   PA9
 #define MOT_B2   PA1
-#define ISENSE_V PA3 
+#define ISENSE_V PA3
 #define ISENSE_U PB13
-#define ISENSE_W PB0 
+#define ISENSE_W PB0
 #define LED_FAULT  PB11
 
 // --- SimpleFOC Objects ---
@@ -72,19 +73,13 @@ enum MotorState {
 };
 MotorState current_state = INITIALIZING;
 
-// --- Motion Command Buffer ---
-struct MotionCommand {
-    float position;
-    float velocity;
-    float acceleration;
+// --- Motion Control State Machine ---
+enum MotionMode {
+    TRAJECTORY,
+    MANUAL_TARGET
 };
-MotionCommand motion_command_buffer;
-volatile bool new_motion_command = false;
-
-// --- Feedforward Gains ---
-float K_ff_vel = 1.0;
-float K_ff_accel = 0.0; 
-
+MotionMode current_motion_mode = MANUAL_TARGET;
+Trajectory trajectory;
 
 // --- Function Prototypes ---
 void sendPackedTelemetry();
@@ -113,23 +108,23 @@ void setup() {
     
     applySettingsToMotor();
 
-    E1.init(); 
+    E1.init();
     DR1.init();
     M1.linkSensor(&E1);
     M1.linkDriver(&DR1);
 
     SIMPLEFOC_DEBUG("Calibrating current sense...");
     CS1.linkDriver(&DR1);
-    if(CS1.init() != 1) { 
+    if(CS1.init() != 1) {
         SIMPLEFOC_DEBUG("ERR: CS init failed!");
         current_state = FAULT;
         while(1);
     }
     M1.linkCurrentSense(&CS1);
-    SIMPLEFOC_DEBUG("...done.");   
+    SIMPLEFOC_DEBUG("...done.");
     
-    M1.foc_modulation = FOCModulationType::SpaceVectorPWM; 
-    M1.torque_controller = TorqueControlType::foc_current; 
+    M1.foc_modulation = FOCModulationType::SpaceVectorPWM;
+    M1.torque_controller = TorqueControlType::foc_current;
     
     M1.init();
 
@@ -138,7 +133,7 @@ void setup() {
     }
     
     M1.initFOC();
-    M1.disable(); 
+    M1.disable();
     Serial3.print("Setup complete. Motor ready with CAN ID: ");
     Serial3.println(board_config.can_id);
     digitalWrite(LED_FAULT, LOW);
@@ -154,7 +149,19 @@ void loop() {
 
     E1.update();
    
-    M1.move();
+    // --- INTEGRATED MOTION LOGIC ---
+    if (current_motion_mode == TRAJECTORY) {
+        M1.move(trajectory.getPosition(micros()));
+        if (trajectory.isDone()) {
+            current_motion_mode = MANUAL_TARGET; // Revert to holding last position
+            M1.target = M1.shaft_angle;
+        }
+    } else {
+        // This handles MANUAL_TARGET mode.
+        M1.move();
+    }
+    // --- END INTEGRATION ---
+    
     M1.loopFOC();
 
     FDCAN_RxHeaderTypeDef rxHeader;
@@ -163,32 +170,40 @@ void loop() {
     if (CAN_Poll(&rxHeader, &rxData[0])) {
         if (rxHeader.Identifier == CAN_ID_SCAN_BROADCAST) {
             sendPackedTelemetry();
-        } else if (rxHeader.Identifier == (CAN_ID_MOTION_COMMAND_BASE + board_config.can_id)) {
-            if (rxHeader.DataLength >= 8) { 
+        } 
+        // --- CORRECTED TRAJECTORY COMMAND HANDLER ---
+        else if (rxHeader.Identifier == (CAN_ID_MOTION_COMMAND_BASE + board_config.can_id)) {
+            if (rxHeader.DataLength >= 8) {
                 int32_t pos_raw;
-                // --- FIX: Revert vel_raw and acc_raw to 16-bit integers ---
                 int16_t vel_raw;
                 int16_t acc_raw;
                 
-                // Unpack the 8-byte message
                 memcpy(&pos_raw, &rxData[0], sizeof(int32_t));
-                memcpy(&vel_raw, &rxData[4], sizeof(int16_t)); 
+                memcpy(&vel_raw, &rxData[4], sizeof(int16_t));
                 memcpy(&acc_raw, &rxData[6], sizeof(int16_t));
                 
-                // --- FIX: Use the new corresponding scaling factors ---
-                motion_command_buffer.position = pos_raw * 0.0001f; 
-                motion_command_buffer.velocity = vel_raw * 0.01f;     // Changed from 0.001
-                motion_command_buffer.acceleration = acc_raw * 0.1f;  // Changed from 0.01
+                // Unscale the received integer values to get floats
+                float target_pos = (float)pos_raw / 10000.0f;
+                float max_vel = (float)vel_raw / 100.0f;
+                float max_accel = (float)acc_raw / 10.0f;
                 
-                new_motion_command = true;
+                // Plan the trajectory using the received parameters
+                trajectory.plan(M1.shaft_angle, target_pos, max_vel, max_accel);
+                
+                // Set the motor up to execute the trajectory
+                M1.controller = MotionControlType::angle;
+                current_motion_mode = TRAJECTORY;
+                if(M1.enabled) {
+                    current_state = OPERATIONAL;
+                    SIMPLEFOC_DEBUG("Trajectory planned. State -> OPERATIONAL");
+                }
             }
-        } else if (rxHeader.Identifier == CAN_ID_SYNC) {
-            Serial3.printf("SYNC received. Motor enabled: %d, State: %d", M1.enabled, current_state);
-            // SYNC now simply means "make sure you're running"
+        } 
+        else if (rxHeader.Identifier == CAN_ID_SYNC) {
             if (M1.enabled && current_state == READY) {
                 M1.controller = MotionControlType::angle;
                 current_state = OPERATIONAL;
-                SIMPLEFOC_DEBUG("State -> OPERATIONAL");
+                SIMPLEFOC_DEBUG("SYNC received. State -> OPERATIONAL");
             }
         }
         else if (rxHeader.Identifier == (CAN_ID_COMMAND_BASE + board_config.can_id)) {
@@ -199,6 +214,7 @@ void loop() {
                 switch(reg) {
                     case REG_STATUS: send_param_response(reg, (uint8_t)M1.enabled); break;
                     case REG_VEL_PID_P: val_f = M1.PID_velocity.P; send_param_response(reg, val_f); break;
+                    // ... (rest of the read cases are the same)
                     case REG_VEL_PID_I: val_f = M1.PID_velocity.I; send_param_response(reg, val_f); break;
                     case REG_VEL_PID_D: val_f = M1.PID_velocity.D; send_param_response(reg, val_f); break;
                     case REG_VEL_PID_LIM: val_f = M1.PID_velocity.limit; send_param_response(reg, val_f); break;
@@ -235,10 +251,8 @@ void loop() {
 
                 switch(reg) {
                     case REG_TARGET: 
-                        // For manual control, set the target and zero out the feedforward terms
                         M1.target = val_f;
-                        M1.velocity_ff = 0.0f;
-                        M1.acceleration_ff = 0.0f;
+                        current_motion_mode = MANUAL_TARGET;
                         break;
                     case REG_ENABLE: 
                         if (val_8 > 0) {
@@ -252,6 +266,7 @@ void loop() {
                         }
                         break;
                     case REG_CONTROL_MODE: M1.controller = (MotionControlType)val_8; break;
+                    // ... (rest of the write cases are the same)
                     case REG_VEL_PID_P: M1.PID_velocity.P = val_f; break;
                     case REG_VEL_PID_I: M1.PID_velocity.I = val_f; break;
                     case REG_VEL_PID_D: M1.PID_velocity.D = val_f; break;
@@ -303,36 +318,19 @@ void loop() {
                     case REG_CUSTOM_SET_ID_AND_RESTART:
                         if (rxHeader.DataLength == 2) {
                             uint8_t new_id = rxData[1];
-                            Serial3.print("Received command to set new ID to ");
-                            Serial3.print(new_id);
-                            Serial3.println(" and restart.");
                             board_config.can_id = new_id;
                             update_config_from_motor(); 
                             saveBoardConfig();          
-                            Serial3.println("Config saved. Restarting MCU now.");
                             delay(100);                 
                             NVIC_SystemReset();
                         }
                         break;
+                    // NOTE: The old REG_CUSTOM_MOTION_COMMAND case has been removed.
                 }
             }
         }
     }
-
-    // ================== FIX STARTS HERE ==================
-    // This is the missing logic block to process the motion command buffer.
-    if (new_motion_command) {
-        // Only apply the new command if the motor is in the OPERATIONAL state
-        if (current_state == OPERATIONAL) {
-            M1.target = motion_command_buffer.position;
-            M1.velocity_ff = K_ff_vel * motion_command_buffer.velocity;
-            M1.acceleration_ff = K_ff_accel * motion_command_buffer.acceleration;
-        }
-        // Reset the flag so this command isn't processed again
-        new_motion_command = false;
-    }
-    // =================== FIX ENDS HERE ===================
-
+    
     unsigned long now = micros();
     if (telemetry_period_us > 0 && (now - last_telemetry_time_us > telemetry_period_us)) {
         last_telemetry_time_us = now;
@@ -343,6 +341,9 @@ void loop() {
         sendStatusFeedback();
     }
 }
+
+
+// --- THE REST OF THE FILE IS UNCHANGED ---
 
 void runMotorCharacterization(float voltage) {
     const float CURRENT_SENSE_CORRECTION_FACTOR = 1.0f; 
